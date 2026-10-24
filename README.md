@@ -11,6 +11,7 @@ Currently supports:
 - NewLuxir() Establish Luxir client at ur addr
 - Index() add docs to a collection
 - Search() Search a collection; tons of helpers too!
+- luxir.Raw() takes a protobuf query so you can technically do any query already, but you get no control flow. This is also rather annoying to work with because you have to use &luxirpb to manually format everything yourself.
 
 What I will work on next:
 
