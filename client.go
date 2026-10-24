@@ -53,3 +53,10 @@ func (l *Luxir) HealthCheck(ctx context.Context) error {
 	}
 	return nil
 }
+
+// Close ;; closes *Luxir.conn ;; FIXME: [easy] [test] [no-coverage]
+//
+// ;; defer *Luxir.Close() when ya make one.
+func (l *Luxir) Close() error {
+	return l.conn.Close()
+}
