@@ -23,6 +23,10 @@ What I will work on next:
 - Batch calls (for large documents) (gRPC limits to 4MB I believe)
 - Docs: Ill write up a robust doc and add some examples once all the above are implemented and then it will be in a MVP state.
 
+What I may add after:
+
+- HTTP support. HTTP and gRPC route through to the same place at the end of the day, but a HTTP only lib could be written only using standard and avoid dealing with gRPC.
+
 ## feel free to contribute
 
 If you want to contribute feel free to open a PR. Make sure the code follows a similar style to the existing code and ideally make sure to have good tests for proposed changes.
