@@ -83,7 +83,7 @@ func toVal(v any) (*luxirpb.Val, error) {
 		}
 		return &luxirpb.Val{Kind: &luxirpb.Val_Arr{Arr: &luxirpb.ArrVal{V: vals}}}, nil
 	default:
-		return nil, fmt.Errorf("insupported type %T", v)
+		return nil, fmt.Errorf("unsupported type %T", v)
 	}
 }
 

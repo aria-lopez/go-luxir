@@ -3,6 +3,8 @@ package luxir
 import (
 	"errors"
 	"fmt"
+
+	"google.golang.org/grpc/health/grpc_health_v1"
 )
 
 // ;; ErrConnecting :: failed to connect to the client given the addr
@@ -40,13 +42,14 @@ func (e *HealthCheckError) Is(target error) bool { return target == ErrHealthChe
 var ErrHealthCheck_SERVING = errors.New("[go-luxir] serving error during health check")
 
 type HealthCheckError_SERVING struct {
-	Err error
+	Status grpc_health_v1.HealthCheckResponse_ServingStatus // ;; what the node reported, anything but SERVING
 }
 
 func (e *HealthCheckError_SERVING) Error() string {
-	return fmt.Sprintf("[go-luxir] response error during health check %v", e.Err)
+	return fmt.Sprintf("[go-luxir] response error during health check: node reported %s", e.Status)
 }
 
-func (e *HealthCheckError_SERVING) Unwrap() error { return e.Err }
-
-func (e *HealthCheckError_SERVING) Is(target error) bool { return target == ErrHealthCheck }
+// Is ;; matches ErrHealthCheck_SERVING, and also ErrHealthCheck since it is a kind of health check error
+func (e *HealthCheckError_SERVING) Is(target error) bool {
+	return target == ErrHealthCheck_SERVING || target == ErrHealthCheck
+}

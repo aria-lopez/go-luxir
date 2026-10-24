@@ -32,7 +32,7 @@ func (e *IndexError) Unwrap() error { return e.Err }
 
 // InternalError ;; code error
 // ;; returns Msg or "" if there is no internal error
-func (e *IndexError) InternalError(message string) string { return message }
+func (e *IndexError) InternalError() string { return e.Msg }
 
 // Status ;; PARTIAL or ERROR
 func (e *IndexError) Status() luxirpb.UpdateResponse_Status { return e.Resp.GetStatus() }

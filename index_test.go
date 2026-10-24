@@ -160,6 +160,9 @@ func TestIndex_ConvertError(t *testing.T) {
 	if !errors.As(err, &ie) {
 		t.Fatalf("err = %v (%T), want *IndexError", err, err)
 	}
+	if ie.InternalError() == "" {
+		t.Error("InternalError() = \"\", want the conversion failure")
+	}
 }
 
 // TestIndex_Unreachable ;; no Luxir listening: an error comes back, and no response

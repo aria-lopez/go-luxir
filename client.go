@@ -51,7 +51,7 @@ func (l *Luxir) HealthCheck(ctx context.Context) error {
 		return &HealthCheckError{Err: err}
 	}
 	if resp.GetStatus() != grpc_health_v1.HealthCheckResponse_SERVING {
-		return &HealthCheckError_SERVING{Err: err}
+		return &HealthCheckError_SERVING{Status: resp.GetStatus()}
 	}
 	return nil
 }

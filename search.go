@@ -29,7 +29,7 @@ func Match(field string, v any) Query {
 	return queryFunc(func() (*luxirpb.Query, error) {
 		val, err := toVal(v)
 		if err != nil {
-			return nil, &MatchError{Err: err, Msg: fmt.Sprintf("[go-luxir] match err, bad toVal %q: %w", field, err)}
+			return nil, &MatchError{Err: err, Msg: fmt.Sprintf("[go-luxir] match %q: %v", field, err)}
 		}
 		m := &luxirpb.Match{Field: field, Val: val}
 		return &luxirpb.Query{Kind: &luxirpb.Query_Match{Match: m}}, nil
@@ -171,14 +171,15 @@ func (l *Luxir) Search(ctx context.Context, collection string, q Query, opts ...
 
 	stream, err := l.searcher.Search(ctx)
 	if err != nil {
-		return nil, &SearchError{Err: err, Msg: fmt.Sprintf("err building search: %v", err)}
+		return nil, &SearchError{Err: err, Msg: fmt.Sprintf("err opening stream: %v", err)}
 	}
 	// check for io.EOF it means the server already ended it
 	if err := stream.Send(req); err != nil && !errors.Is(err, io.EOF) {
 		return nil, &SearchError{Err: err}
 	}
-	// FIXME: this can error
-	stream.CloseSend()
+	if err := stream.CloseSend(); err != nil {
+		return nil, &SearchError{Err: err}
+	}
 
 	// results come back in batches potentially, so iter through the recv
 	res := &SearchResult{Offset: p.offset}
@@ -192,8 +193,8 @@ func (l *Luxir) Search(ctx context.Context, collection string, q Query, opts ...
 		}
 		// we made contact but there can still be an error (also it can follow earlier batches)
 		// and thats why we dont send out partial results
-		if resp.GetError() != nil {
-			return nil, &SearchError{Err: err}
+		if e := resp.GetError(); e != nil {
+			return nil, &SearchError{Luxir: e}
 		}
 		// also collect any new warningss
 		res.Warnings = append(res.Warnings, resp.GetWarnings()...)
