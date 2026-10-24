@@ -1,0 +1,3 @@
+{"time":"2026-10-23T21:21:18.063366745-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":128602}
+{"time":"2026-10-23T21:31:43.186681439-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":138816}
+{"time":"2026-10-23T21:33:47.682257731-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":144749}
