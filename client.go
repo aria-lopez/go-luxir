@@ -3,6 +3,7 @@ package luxir
 import (
 	"context"
 
+	"github.com/aria-lopez/go-luxir/luxirpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -13,8 +14,9 @@ const DefaultAddr = "localhost:9401"
 
 // Luxir ;;
 type Luxir struct {
-	conn   *grpc.ClientConn
-	health grpc_health_v1.HealthClient
+	conn    *grpc.ClientConn
+	health  grpc_health_v1.HealthClient
+	indexer luxirpb.IndexerClient
 }
 
 // NewLuxir ;; Get a new instance of *Luxir by the provided addr
@@ -31,8 +33,9 @@ func NewLuxir(addr string) (*Luxir, error) {
 	}
 
 	return &Luxir{
-		conn:   conn,
-		health: grpc_health_v1.NewHealthClient(conn),
+		conn:    conn,
+		health:  grpc_health_v1.NewHealthClient(conn),
+		indexer: luxirpb.NewIndexerClient(conn),
 	}, nil
 }
 

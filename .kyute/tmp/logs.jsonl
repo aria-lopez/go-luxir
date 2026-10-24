@@ -1,3 +1,13 @@
 {"time":"2026-10-23T21:21:18.063366745-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":128602}
 {"time":"2026-10-23T21:31:43.186681439-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":138816}
 {"time":"2026-10-23T21:33:47.682257731-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":144749}
+{"time":"2026-10-23T22:16:45.165537219-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":186289}
+{"time":"2026-10-23T22:36:05.555634598-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":199657}
+{"time":"2026-10-23T22:45:30.027443637-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":210023}
+{"time":"2026-10-23T22:47:28.51528482-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":212745}
+{"time":"2026-10-23T23:12:03.023928088-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":239338}
+{"time":"2026-10-23T23:15:14.849145636-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":242812}
+{"time":"2026-10-23T23:18:21.198568882-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":245171}
+{"time":"2026-10-23T23:20:24.490505738-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":248425}
+{"time":"2026-10-23T23:20:28.879079887-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":248615}
+{"time":"2026-10-23T23:21:44.448747576-07:00","level":"INFO","source":{"function":"main.run","file":"/home/a/kyute/cmd/kyute/main.go","line":88},"msg":"kyute started","pid":250244}

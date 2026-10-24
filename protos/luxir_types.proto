@@ -1,0 +1,1378 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+import "google/protobuf/struct.proto";
+
+option java_package = "org.luxir.types";
+option java_outer_classname = "LuxirTypes";
+option objc_class_prefix = "Luxir";
+
+package luxir;
+
+// Top-level search request that can contain multiple search operations.
+message SearchRequest {
+  // Optional opaque identifier, echoed in every response to this request.
+  // Use distinct identifiers to correlate requests and responses in a stream.
+  string request_id = 1;
+  string collection = 2; // empty selects the default collection, "main"
+
+  // Multiple search operations in a single request.
+  map<string, SearchOp> ops = 3;
+
+  // Index view freshness tolerance in milliseconds. 0 (the default) requires the
+  // latest advertised commit: wait for an immediate commit's response, and a
+  // freshness_ms=0 search is guaranteed to see it.
+  // A positive value lets the search reuse a reader up to this stale, avoiding
+  // reader churn under frequent commits. It is a tolerance, not a latency bound:
+  // there is no guaranteed time from ingest to visibility.
+  uint64 freshness_ms = 4;
+
+  // Time zone for date math and date literals without an offset. Empty is UTC;
+  // accepts Z, UTC, fixed offsets, or a case-sensitive IANA zone name.
+  string time_zone = 5;
+
+  // HTTP response framing. ENVELOPE (default): one JSON envelope per batch.
+  // DOCS: one document per line, with optional _header_ metadata records.
+  // The HTTP ?format=docs parameter also selects DOCS. gRPC rejects DOCS.
+  // See docs/guide/http-api.md for the NDJSON formats.
+  ResponseFormat response_format = 6;
+
+  // Return execution details for instrumented operations; see ExecutionProfile.
+  bool profile = 7;
+
+  // Intra-request parallelism: 0 (default) lets the engine choose; 1 runs
+  // serially on the shared executor; -1 permits unlimited parallelism.
+  // Automatic execution is serial on the receiving thread. Other values
+  // are rejected.
+  int32 max_parallel = 8;
+}
+
+enum ResponseFormat {
+  ENVELOPE = 0;
+  DOCS = 1;
+}
+
+// A named search operation. The name is its key in the enclosing ops map.
+message SearchOp {
+  oneof kind {
+    TopDocs top_docs = 1;
+    Fusion fusion = 2;
+    FieldFacet field_facet = 8;
+    RangeFacet range_facet = 9;
+    QueryFacet query_facet = 10;
+    ExprOp expr_op = 15;
+  }
+  Domain domain = 20; // optional override of the incoming document domain
+}
+
+// An expression aggregate over the operation's incoming document domain.
+// The operation name is the key in the enclosing ops map.
+message ExprOp {
+  string expr = 1;
+  map<string, Val> vars = 2;
+}
+
+// Placement preference for returned document fields: dense columns
+// (DocList.columns) vs per-document maps (DocList.docs).  DEFAULT resolves
+// per transport: HTTP/JSON -> ROWS, gRPC -> COLUMNS.  Under COLUMNS,
+// explicitly named fields are returned as dense columns while discovered
+// fields (empty or wildcard selectors) use docs; under ROWS everything is
+// returned in docs.
+enum DocFormat {
+  DEFAULT = 0;
+  ROWS = 1;
+  COLUMNS = 2;
+}
+
+message TopDocs {
+  Query query = 1;            // unset selects all documents (browse / filter-only search)
+  repeated Filter filter = 2;
+
+  // Zero-based rank of the first returned document; must be >= 0. Skip this
+  // many ranked matches, then return up to limit (-1: all remaining; 0: none).
+  // Each response DocList.offset is the absolute rank of that batch's first
+  // row, or the requested offset for an empty page. Ignored as a Fusion source.
+  int64 offset = 3;
+
+  // Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining.
+  optional sint64 limit = 4;
+  bool get_number = 5;          // return the number of matching documents
+  bool get_scores = 6;          // return the relevancy score for each document returned
+
+  // Fields to return for each document.  Empty returns every retrievable field
+  // (stored or column-backed; not vectors or engine fields such as _version_),
+  // discovered from the index and placed in per-document rows (DocList.docs).
+  // A name containing '*' is a pattern expanded the same way: the matching
+  // retrievable fields, in rows; matching nothing is not an error.  Explicitly
+  // named fields win on collision and may name anything, vectors and engine
+  // fields included.
+  repeated string fields = 7;
+  repeated SortSpec sort = 8;
+
+  // Maximum documents per streaming batch. Nonpositive = default (100);
+  // the server caps positive values at 256. More documents produce more
+  // batches. Ignored beneath a facet bucket, where all rows return together.
+  int32 batch_size = 9;
+  DocFormat document_format = 10;  // rows vs columns placement of returned fields (see DocFormat)
+
+  map<string, SearchOp> ops = 15;  // sub-facets or search operations performed over docs that match this query.
+}
+
+// Hybrid-search fusion: run several source queries (each a full TopDocs spec)
+// and merge their results into a single ranked list.
+//
+// Per-source response-shape fields (`fields`, `batch_size`, `offset`,
+// `get_scores`, `get_number`, `document_format`) are ignored - Fusion controls
+// response shape at the top level. Per-source `ops` are rejected; put facets
+// and metrics in Fusion.ops.
+// Each source's `query`, `sort`, `limit`, and any per-source `filter` are used
+// to produce that source's ranked list.
+//
+// The fusion-level `filter` is ANDed with each source's own filters.
+message Fusion {
+  // Named source queries. At least one source is required.
+  map<string, TopDocs> sources = 1;
+
+  // Filters applied to every source. except_ops is not supported here or
+  // in source filters.
+  repeated Filter filter = 2;
+
+  // Maximum fused documents to return. Unset = 10; 0 = none; -1 = all remaining.
+  optional sint64 limit = 3;
+
+  // Required fusion method.
+  oneof method {
+    RrfFusion rrf = 10;
+  }
+
+  // Response shape (mirrors TopDocs).
+  // Zero-based rank of the first returned fused document; must be >= 0.
+  // Return up to limit after skipping. Source limits remain candidate-pool
+  // sizes: paging cannot reach beyond the union of their ranked windows.
+  // Each response DocList.offset is the absolute rank of that batch's first
+  // row, or the requested offset for an empty page.
+  int64 offset = 4;
+  bool get_number = 5; // return the number of distinct documents in the source union
+  bool get_scores = 6;
+  repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
+  int32 batch_size = 8; // same batching rules as TopDocs.batch_size
+  DocFormat document_format = 9;  // rows vs columns placement of returned fields (see DocFormat)
+
+  // Runs over the union of filtered source ranked lists, as counted by found.
+  // Fusion limit and offset do not affect this candidate domain.
+  map<string, SearchOp> ops = 15;
+}
+
+// Reciprocal Rank Fusion: fused_score(d) = sum over sources s of
+// 1 / (k + rank_s(d)), where rank_s(d) is d's 1-based rank in source s
+// (or omitted if d does not appear in s).  k=60 is the standard default.
+message RrfFusion {
+  int32 k = 1;  // 0 means use default (60)
+}
+
+message SortSpec {
+  string expr = 1;
+  map<string, Val> vars = 2;
+
+  enum SortDir {
+    UNKNOWN = 0;
+    ASC = 1;
+    DESC = 2;
+  }
+  SortDir dir = 10;
+}
+
+message Query {
+  // An unset kind selects all documents, same as `all`.
+  oneof kind {
+    Match match = 1;                // selects all documents with a value match in the specified field
+    BooleanQuery boolean = 2;
+    bool all = 3;                   // selects all documents
+    ExistsQuery exists = 4;         // selects documents that supplied a value for the field
+    PhraseQuery phrase = 5;         // selects all documents with a phrase
+    KnnQuery knn = 6;               // nearest-neighbor search over a vector field
+    ConstantScoreQuery constant_score = 7; // wraps a query and replaces each hit's score
+    PrefixQuery prefix = 8;         // selects documents by term prefix
+    FuzzyQuery fuzzy = 9;           // selects documents by fuzzy (edit-distance) term match
+    SimpleQuery simple_query = 10;  // forgiving end-user query string (search-box input)
+    RangeQuery range = 11;          // selects documents with a field value in a range
+    ExprQuery expr = 12;            // an expression in the Luxir query language (rigorous grammar)
+    GeoBoxQuery geo_box = 13;       // selects GEO_POINT values inside an inclusive bounding box
+    GeoDistanceQuery geo_distance = 14; // selects GEO_POINT values within a radius of a center
+    BoostQuery boost = 15;          // multiplies every hit score of a wrapped query
+    RescoreQuery rescore = 16;      // preserves matches and replaces each hit's score
+    WildcardQuery wildcard = 17;    // selects documents by wildcard term match
+    RegexQuery regex = 18;          // selects documents by regular-expression term match
+    AnyOfQuery any_of = 19;         // constant-score exact value-set membership
+  }
+}
+
+message ExistsQuery {
+  string field = 1;
+}
+
+message ConstantScoreQuery {
+  Query query = 1;
+
+  // Score assigned to every match. Unset = 1.0; an explicit 0.0 is preserved.
+  optional float score = 2;
+}
+
+message BoostQuery {
+  Query query = 1;
+
+  // Score multiplier. Unset = 1.0; 0 preserves matches with zero scores.
+  // Must be finite and >= 0.
+  optional float boost = 2;
+}
+
+message RescoreQuery {
+  Query query = 1;
+  string expr = 2;
+  map<string, Val> vars = 3;
+}
+
+// Nearest-neighbor query against a searchable vector field. Search is exact
+// when no ANN index is available; an ANN index may produce approximate results.
+// The query vector must be non-empty and match the field's dimensions.
+// Deleted documents and documents outside the enclosing domain are excluded.
+// Multi-valued fields return one hit per document using its highest similarity.
+message KnnQuery {
+  string field = 1;        // vector field name (e.g. "embedding_v")
+  Vector query = 2;        // query vector - must match the field's dims
+  int32 k = 3;             // number of nearest-neighbor documents to return; must be positive
+
+  // Require exact top-k results by scanning stored vectors. Cost is linear
+  // in the number of stored vectors; refine_candidates and ivf are ignored.
+  bool exact = 4;
+
+  // Candidate-pool size for full-precision rescoring of ANN results, before
+  // collapsing multiple vectors to one hit per document. Clamped up to k;
+  // 0 selects an adaptive default. Larger pools can improve recall at a cost
+  // in memory and latency. Fewer candidates may be available.
+  int32 refine_candidates = 5;
+  Ivf ivf = 6; // ignored for exact search and segments without an IVF index
+
+  // Search effort for IVF indexes.
+  message Ivf {
+    // Merge-stable IVF effort: lists to probe if this field were one IVF index
+    // with nlist=sqrt(live vectors). 0 = adaptive default; positive values cap
+    // search effort.
+    int32 nprobe = 1;
+    // Minimum fraction of live vectors to scan, in [0,1]. 0 = no floor.
+    float min_scan_fraction = 2;
+  }
+}
+
+// Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or
+// boolean scalar values; numeric and DATE fields accept string or numeric
+// scalars. Null matches nothing. Arrays and structured values are rejected,
+// and GEO_POINT is unsupported. TEXT values are analyzed and scored; use
+// AnyOfQuery for constant-score value sets and SimpleQuery or ExprQuery for
+// multi-field text.
+message Match {
+  string field = 1;
+  Val val = 2;
+
+  // How to combine the multiple terms an analyzed text field can produce.
+  // Unset = OR.
+  Operator operator = 3;
+
+  // Minimum number of the analyzed terms that must match (the OR..AND middle
+  // ground).  When set it overrides `operator`; clamped to the term count.
+  // Mirrors BooleanQuery.min_match.
+  int32 min_match = 4;
+
+  enum Operator {
+    OPERATOR_UNSPECIFIED = 0;  // treated as OR
+    OR = 1;                    // a doc matches if any analyzed term matches
+    AND = 2;                   // a doc must match every analyzed term
+  }
+}
+
+// Constant-score exact value-set membership using the field's value binding.
+// TEXT values are analyzed: zero tokens contribute nothing, one token is
+// accepted, and multiple tokens are an error. STRING values use the field's
+// normalizer; ID values remain verbatim before applying long_terms. Numeric
+// and DATE values use the same scalar coercion as ingest.
+message AnyOfQuery {
+  string field = 1;
+
+  // Required scalar or array of scalars. Null and nested arrays are errors.
+  // An empty array matches nothing; duplicate values are ignored.
+  Val values = 2;
+}
+
+// Matches documents whose field value falls in the given range.  All bounds
+// are optional; omit a side for an open-ended range.  Set at most one of
+// gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is
+// an error.  With no bounds the query matches every document that has a value
+// for the field.  A doc with no value never matches.
+//
+// Numeric fields (INT/FLOAT/DOUBLE/DATE) require a column. Bounds go
+// through the same value-coercion contract as ingest, so querying a literal
+// finds the documents ingested with it.  DATE accepts ISO-8601 strings or
+// epoch millis, and a partial date names its whole window: bounds include the
+// granule they name ([2024-01 TO 2024-06] covers January through June;
+// exclusive bounds exclude the granule whole).  FLOAT/DOUBLE compare by
+// IEEE-754 total order: -0.0 sorts below +0.0 and NaN sorts above +Inf.
+//
+// Term-backed fields (TEXT/STRING/ID) range over indexed terms in byte order
+// (no collation), constant-scoring. TEXT bounds use multi-term normalization
+// without tokenization; STRING bounds use the field's normalizer. Exact
+// bounds follow the field's long_terms policy. Uses the field's value binding.
+message RangeQuery {
+  string field = 1;
+  Val gte = 2;   // lower bound, inclusive (>=)
+  Val gt  = 3;   // lower bound, exclusive (>)
+  Val lte = 4;   // upper bound, inclusive (<=)
+  Val lt  = 5;   // upper bound, exclusive (<)
+}
+
+// Inclusive geographic bounding box in degrees. Bounds are quantized to the
+// storage grid exactly like ingest. min_lon > max_lon crosses the dateline;
+// min_lat > max_lat is an error. Boxes degenerate at +90 latitude or +180
+// longitude match nothing.
+//
+// Named scalar bounds deliberately avoid positional ambiguity: the VALUE
+// array contract [x, y] = [lon, lat] does not apply to this message.
+message GeoBoxQuery {
+  string field = 1;
+  double min_lat = 2; // south edge, degrees in [-90, 90]
+  double max_lat = 3; // north edge
+  double min_lon = 4; // west edge, degrees in [-180, 180]
+  double max_lon = 5; // east edge; min_lon > max_lon crosses the dateline
+}
+
+// Geographic distance query with a center in degrees and radius in meters.
+// Matches when at least one GEO_POINT value is within the inclusive radius.
+//
+// Named center scalars deliberately avoid positional ambiguity: the VALUE
+// array contract [x, y] = [lon, lat] does not apply to this message.
+message GeoDistanceQuery {
+  string field = 1;
+  double lat = 2;           // center latitude, degrees in [-90, 90]
+  double lon = 3;           // center longitude, degrees in [-180, 180]
+  double radius_meters = 4; // inclusive radius, finite and non-negative
+}
+
+message Filter {
+  Query query = 1; // required; restricts matches without contributing to scores
+
+  // Keys in the enclosing TopDocs.ops map that should not receive this filter.
+  // The filter still applies to the TopDocs results and other sub-operations.
+  // Names must be nonempty, distinct, and present in that ops map. Empty
+  // applies the filter to all sub-operations. Not supported on Fusion filters
+  // or Fusion source filters.
+  repeated string except_ops = 2;
+}
+
+message BooleanQuery {
+  repeated Query filter = 1;       // required clauses that do not add to the score
+  repeated Query required = 2;     // required clauses that do add to the score
+  repeated Query optional = 3;     // optional clauses that add to the score
+  repeated Query prohibited = 4;   // prohibited clauses that must not match
+
+  // Minimum number of optional clauses that must match.  Unset (0): with any
+  // required or filter clause present, optional clauses only rank coincident
+  // matches; with only optional clauses, at least one must match.  Setting
+  // min_match >= 1 makes the optional group a real constraint alongside
+  // required/filter clauses; values above the clause count mean all of them.
+  int32 min_match = 5;
+}
+
+// Matches documents where `field` has a term starting with `prefix`. TEXT
+// fields apply multi-term normalization without tokenization; STRING fields
+// apply their normalizer and ID fields use the bytes exactly. An empty prefix
+// matches documents that have at least one indexed term for the field.
+message PrefixQuery {
+  string field = 1;
+  string prefix = 2;
+}
+
+// Matches an entire indexed term. `*` matches any bytes, `?` matches one
+// codepoint, and backslash escapes the next character. On TEXT fields, literal
+// characters fold the way the field folds text; `*`, `?`, and escapes are
+// syntax and never fold. STRING fields also normalize literal characters;
+// ID fields use literals verbatim.
+message WildcardQuery {
+  string field = 1;
+  string pattern = 2;
+}
+
+// Matches an anchored whole indexed term using `|`, concatenation, groups,
+// repetition, `.`, and character classes. `^` and `$` are literals. On TEXT
+// fields, literal characters fold the way the field folds text; character
+// classes and ranges are codepoint-exact. STRING fields also normalize literal
+// characters; ID fields use literals verbatim.
+message RegexQuery {
+  string field = 1;
+  string pattern = 2;
+}
+
+// Matches indexed terms within byte-wise Levenshtein distance of `term`. TEXT
+// fields apply multi-term normalization without tokenization; STRING fields
+// apply their normalizer and ID fields use it verbatim. Scoring queries use
+// blended BM25 statistics; filter queries use constant scores.
+message FuzzyQuery {
+  string field = 1;
+  string term = 2;
+
+  // Maximum edit distance, 0..2. Unset = AUTO by term length:
+  // 0 for <=2 bytes, 1 for <=5, else 2.
+  optional int32 max_edits = 3;
+
+  // Leading bytes that must match exactly. Unset = 1; 0 = no required prefix.
+  optional int32 prefix_length = 4;
+
+  // Max term expansions, closest terms first. Unset/0 = default 50. A
+  // positive value requests that cap; the operator/clause budget may lower it
+  // with a warning. Negative values are rejected.
+  int32 max_expansions = 5;
+}
+
+message PhraseQuery {
+  string field = 1;
+
+  // Set exactly one of these.
+  string text = 2;               // un-analyzed text that should yield multiple words when analyzed. ex: "Thomas Anderson"
+  repeated string words = 3;     // un-analyzed list of words. ex: ["Yonik","Seeley"]
+  repeated string terms = 4;     // analyzed list of terms as strings
+  repeated bytes terms_bin = 5;  // analyzed list of binary (raw bytes) terms
+
+  // Maximum spread of rebased positions: max(docPos-queryPos) minus
+  // min(docPos-queryPos). Must be nonnegative. Adjacent transposition costs
+  // 2; this is not the number of words between terms. Zero is exact.
+  int32 slop = 6;
+  repeated int32 positions = 15; // optional positions of the terms
+}
+
+// An expression in the Luxir query language, with strict syntax and precise
+// parse errors. Raw search-box input can use SimpleQuery. Expressions have
+// structured Query equivalents and use the same field analysis rules.
+//
+// Syntax summary: field:value, field:"a phrase" (or '...'), field:(grouped
+// boolean scope), AND / OR / NOT with real precedence (NOT > AND > OR),
+// +required / -prohibited prefixes (may not mix with AND/OR at one level),
+// ranges field:[a TO b] / {a TO b} and comparisons field:>=v, trailing * for
+// prefix, term~N for fuzzy (bare ~ = auto), *:* matches everything, and the
+// function form name(main value, arg=value, ...) reaching the callable query
+// types by their JSON names (kNN and geo queries require structured
+// messages). $name references a value bound in `vars`. Unfielded bare words
+// are a parse error.
+message ExprQuery {
+  string q = 1;  // the expression
+
+  // Values referenced from the expression as $name.  Bound as VALUES (never
+  // re-parsed as syntax), so end-user input is safe to pass through:
+  // {"q": "simple_query($input, fields=[title])", "vars": {"input": ...}}.
+  map<string, Val> vars = 2;
+}
+
+// Forgiving end-user query for raw search-box input. Malformed query text
+// degrades to a valid query. Reported degradations appear in SearchResponse.warnings.
+//
+// Syntax: bare words (searched across `fields`), + (the NEXT clause is
+// required; needs a preceding clause to combine with, so a leading + is
+// inert), -word (must not; under the default OR this is its own
+// all-except-word clause - restrictive negation needs operator AND),
+// a | b (or), "a phrase", (grouping), trailing * (prefix), word~N (fuzzy;
+// bare ~ = auto edits), \ escapes the next character, and field:value /
+// field:"a phrase" fielded terms.  A colon token whose field name is not
+// queryable degrades to literal text against `fields`.
+message SimpleQuery {
+  string q = 1;  // the raw user input
+
+  // The fields unfielded (bare) terms search; scores sum across fields.
+  // Required and non-empty. Invalid request parameters can cause errors even
+  // though malformed q text is tolerated.
+  repeated string fields = 2;
+
+  // How adjacent clauses combine.  Unset = OR (any clause may match).
+  Match.Operator operator = 3;
+
+  // Minimum number of top-level optional clauses that must match (mirrors
+  // BooleanQuery.min_match).  Silently inapplicable when the parsed top
+  // level cannot honor it (a single clause, required clauses from + or the
+  // AND operator).
+  int32 min_match = 4;
+
+  // Narrows which field names the field:value syntax may reach.  Empty =
+  // every queryable schema field.  It can only narrow that set - listing a
+  // name the schema cannot query does not make it work.  A field: token
+  // outside the allowed set is literal text, never an error.
+  repeated string allowed_fields = 5;
+}
+
+
+// How facet selections filter the enclosing TopDocs results and its
+// sub-operations. Nonempty selected is supported only on facets directly in
+// TopDocs.ops. Selections on different facets combine with AND. Domain
+// overrides can discard these filters; see Domain.apply_parent_filters.
+enum SelectionMode {
+  ANY = 0; // match any selected value; omit this selection's filter from its own facet
+
+  // Require every selected value. Keep this selection's filter on its own
+  // facet so each unselected bucket counts matches if that value is added.
+  ALL = 1;
+}
+
+// Buckets of distinct field values, using the field's value binding.
+// STRING/ID support sub-operations and custom sorts. INT/DATE/TEXT support
+// counts, limits, mincount, missing, and selections.
+message FieldFacet {
+  string field = 1;
+
+  // Maximum ordinary buckets. Unset = 5; 0 = none; -1 = all.
+  // Selected buckets outside the ordinary page are appended after it.
+  optional sint64 limit = 2;
+
+  // Minimum bucket count. Unset includes only buckets with matches.
+  // STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain.
+  // INT/DATE require a positive value when set.
+  optional int64 mincount = 3;
+  bool missing = 4; // return the count of documents without a value
+
+  // One metric sub-operation name. Unset sorts by count
+  // descending, then bucket value ascending.
+  repeated SortSpec sort = 5;
+  map<string, SearchOp> ops = 6;  // sub-facets or search operations performed per bucket
+
+  // Scalar or array of selected values, coerced as AnyOfQuery values. Selected
+  // buckets missing from the ordinary page append in input order with exact
+  // counts, even below mincount or absent from the index. Null is an error.
+  Val selected = 7;
+  SelectionMode selection_mode = 8; // ALL requires a nonempty selection
+}
+
+message CalendarGap {
+  int32 n = 1; // number of civil units per bucket; must be positive
+  enum Unit {
+    UNKNOWN = 0;
+    DAY = 1;
+    WEEK = 2;
+    MONTH = 3;
+    QUARTER = 4;
+    YEAR = 5;
+  }
+  Unit unit = 2;
+}
+
+// Numeric or DATE buckets using the field's value binding. Each bucket is
+// inclusive at its lower bound and exclusive at its upper bound; the final
+// bucket is clipped to end. start must be less than end. Buckets return in
+// lower-bound order.
+message RangeFacet {
+  string field = 1;
+  Val start = 2; // required inclusive start of the range
+  Val end = 3;   // required exclusive end of the range
+  oneof gap_kind {
+    Val gap = 4; // positive fixed width in field units; integer milliseconds for DATE
+    CalendarGap calendar_gap = 10; // civil gap for DATE fields only
+  }
+  optional int64 mincount = 5; // minimum bucket count; unset = 0; must be >= 0
+  bool missing = 6; // return the count of documents without a value
+  map<string, SearchOp> ops = 8;  // sub-facets or search operations performed per bucket
+  string time_zone = 9; // empty inherits SearchRequest.time_zone; DATE fields only
+
+  // Scalar or array naming generated bucket lower bounds. Selected buckets
+  // are returned even below mincount. Null, nongenerated bounds, and duplicate
+  // bounds after coercion are errors.
+  Val selected = 11;
+  SelectionMode selection_mode = 12; // same filtering rules as FieldFacet; see SelectionMode
+}
+
+message QueryBucket {
+  string name = 1; // nonempty output label and selection key; unique within the facet
+  Query query = 2; // required; the bucket predicate
+}
+
+// Named query buckets. A document may contribute to more than one bucket.
+message QueryFacet {
+  repeated QueryBucket buckets = 1; // required, nonempty; response order = request order
+  map<string, SearchOp> ops = 6; // sub-ops per bucket
+  Val selected = 7; // bucket name or array of distinct existing names; null is an error
+  SelectionMode selection_mode = 8; // same filtering rules as FieldFacet; see SelectionMode
+}
+
+// Overrides the incoming document set for an operation directly in
+// SearchRequest.ops or TopDocs.ops. Not supported directly in Fusion.ops
+// or beneath facet buckets.
+message Domain {
+  // If present, replaces the incoming domain with this query's matches
+  // across the collection. If absent, inherits the incoming domain.
+  Query query = 2;
+
+  // With query set, reapply the immediate parent's filters, including facet
+  // selections, while respecting except_ops. Default false discards them.
+  // Requires query; does not restore the parent's query or ancestor domain.
+  optional bool apply_parent_filters = 3;
+
+  // Additional non-scoring constraints, ANDed with the inherited or reset
+  // domain. Entries and query must each specify a query kind.
+  repeated Query filter = 5;
+}
+
+// A nonfatal degradation reported by the query parser or engine. Documented
+// defaults, ignored parameters, and clamps need not produce warnings.
+message Warning {
+  string code = 1;     // stable machine key, e.g. "fuzzy_clamped", "field_narrowed"
+  string message = 2;  // human-readable detail
+}
+
+// A failure.  The same shape everywhere an error appears: SearchResponse.error,
+// UpdateResponse.error and its per-document errors, the HTTP error body, and
+// gRPC status details.  kind is the coarse class: it selects the HTTP status
+// and gRPC status code, and tells a client whether to fix the request, the
+// target, or retry, without knowing the code.  code is the stable machine key
+// (snake_case, like Warning.code); new codes appear under existing kinds
+// without changing this shape.  message is human detail, not a contract.
+message Error {
+  enum Kind {
+    UNKNOWN = 0;
+    INVALID_REQUEST = 1;      // the request as written cannot be served (HTTP 400)
+    NOT_FOUND = 2;            // the addressed collection or route does not exist (404)
+    ALREADY_EXISTS = 3;       // the request would create what already exists (409)
+    FAILED_PRECONDITION = 4;  // the node's state forbids the operation, e.g. --read-only (403)
+    RESOURCE_EXHAUSTED = 5;   // a size or memory ceiling was exceeded (429; 413 for request_too_large)
+    UNAVAILABLE = 6;          // the target exists but cannot serve now: shutting down, being deleted, failed to load (503)
+    INTERNAL = 7;             // a server-side failure the request did not cause (500)
+  }
+  Kind kind = 1;
+  string code = 2;
+  string message = 3;
+}
+
+// Execution details for instrumented operations. STRING/ID field facets
+// provide profiles; other operations may be absent from this list.
+message ExecutionProfile {
+  repeated ExecutionProfileOp ops = 1;
+}
+
+message ExecutionProfileOp {
+  string name = 1;
+  repeated ExecutionProfilePiece pieces = 2;
+}
+
+// Execution details for one segment of an operation.
+message ExecutionProfilePiece {
+  string kind = 1; // "segment"
+  int32 segment = 2;
+  int32 max_doc = 3;
+  string strategy = 4;
+  optional sint64 cardinality = 5;
+  optional sint64 domain_size = 6;
+  int64 thread_id = 7;
+  uint64 elapsed_us = 8;
+
+  // Human-readable execution notes. Contents and formatting may change;
+  // do not parse these entries.
+  repeated string details = 9;
+}
+
+// Top-level response to a Search request
+message SearchResponse {
+  string request_id = 1;
+  map<string, Val> ops = 2; // the results of the search operations in the request, keyed by operation name.
+
+  // Present on a failed request's final response; ops is then empty.
+  // A final error may follow earlier result batches.
+  Error error = 3;
+  repeated Warning warnings = 4; // final response only, on success or failure
+  ExecutionProfile profile = 5; // final response only, when SearchRequest.profile is true
+  bool more = 15;  // if true, expect at least one more streaming response to the logical request.
+}
+
+
+// A batch of returned documents.  Document i is the merge of columns row i
+// and docs[i]; all-columns (docs absent) and all-docs (columns empty) are
+// just the degenerate cases.  Which fields land where is a function of the
+// request (see DocFormat), never of the data.
+message DocList {
+  // Exact match count when get_number was requested. For Fusion, counts
+  // distinct documents in the union of source ranked lists, before paging.
+  optional sint64 found = 1;
+
+  // Dense columns; each has exactly row_count slots.
+  map<string, Column> columns = 3;
+
+  // Per-document field maps.  When present: exactly row_count entries;
+  // docs[i] holds the fields of document i not represented as a dense
+  // column.  A field name never appears in both columns and docs[i].
+  repeated Map docs = 5;
+
+  // Number of documents in this batch, including rows with no returned fields.
+  // A count-only response has row_count=0.
+  int32 row_count = 6;
+
+  int64 offset = 4;
+  map<string, Val> ops = 14; // sub-operation results performed on the TopDocs query.
+  bool more = 15; // true if this document list has more batches; see SearchResponse.more
+}
+
+
+message FacetResult {
+  Column bucket_ids = 2;
+  repeated int64 counts = 3;
+  optional int64 missing = 4; // the number of documents that do not have this field
+  map<string, Val> ops = 22;  // sub-operation results performed per bucket, like a sub-facet or statistics.
+  int64 offset = 6;
+}
+
+//
+//  Indexing
+//
+
+// Parameters governing how a commit is performed.  Presence of this message in an
+// UpdateRequest indicates the request should commit; absence means no commit.
+message CommitParams {
+  // Commit deadline in milliseconds. 0 (default) commits before responding;
+  // a positive value schedules a deferred commit and responds without waiting.
+  // Deferred requests coalesce at the earliest outstanding deadline. An
+  // explicit commit also satisfies outstanding deadlines. max_segments,
+  // build_aux_indexes, or wait_for_merges force an immediate commit instead.
+  // Search visibility also depends on SearchRequest.freshness_ms.
+  uint64 commit_within_ms = 1;
+
+  // Build missing aux overlays as part of this commit. An overlay already
+  // present on a segment is retained rather than rebuilt.
+  //   []                 - request no aux builds
+  //   ["*"]              - build every eligible missing vector overlay
+  //   ["vec.title_v"]     - build the missing vector overlay for title_v
+  // Only "*" and exact overlay names are supported; no partial-name patterns.
+  repeated string build_aux_indexes = 2;
+
+  // If true, this commit will wait for any in-flight merges to finish before publishing.
+  bool wait_for_merges = 3;
+
+  // Merge down so the data visible at this commit resides in at most this many
+  // segments. 0 (default) = no forced merging. The response is not sent until
+  // the merged index is durably published: at return, everything this commit
+  // made visible lives in <= max_segments segments (concurrent ingestion after
+  // this commit may add new segments; they are not covered by the promise).
+  // The response waits for the merged layout even when commit_within_ms is
+  // positive.
+  uint32 max_segments = 4;
+}
+
+// Index or delete documents, with an optional commit.
+message UpdateRequest {
+  // Optional opaque identifier, echoed in the response for correlation.
+  string request_id = 1;
+
+  string collection = 3; // empty selects the default collection, "main"
+
+  repeated Map docs = 4;
+
+  // Document IDs to delete.  Deletes never fail per-id; deleting a nonexistent id
+  // is a no-op.
+  repeated string delete_ids = 6;
+
+  // Skip overwrite/dedupe for faster indexing when incoming IDs are known to be
+  // unique and do not already exist in the collection.
+  // Default (false) overwrites any existing document with the same ID.
+  bool allow_dups = 7;
+
+  // If true, all documents in this request must be successfully indexed or none will be.
+  // Processing stops at the first failing document: documents already indexed by this
+  // request are rolled back, queued delete_ids from this request are rolled back, and
+  // later documents are not attempted (and not listed in errors).
+  // Atomicity is per-request; it does not span multiple requests in a stream.
+  bool all_or_none = 8;
+
+  // If true, return the ids of indexed documents in the response.
+  bool return_ids = 9;
+
+  // Commit parameters.  If present, this request will commit; if absent, no commit is performed.
+  CommitParams commit = 10;
+
+  // Renames input document keys onto schema fields for this request's docs, applied
+  // before schema lookup: a doc key found in the map indexes under the mapped name.
+  // An entry mapping to "" drops that input key.  After mapping, a name appearing
+  // more than once in a doc keeps the last occurrence (the same last-wins rule as
+  // duplicate keys).  Keys not in the map index under their own name unless
+  // drop_unmapped is set.  This reshapes a foreign document stream per request,
+  // without editing the input or the schema.
+  map<string, string> field_map = 11;
+
+  // If true, doc keys not present in field_map are dropped instead of indexed.
+  // Requires a non-empty field_map (note "id" is dropped too unless mapped).
+  bool drop_unmapped = 12;
+}
+
+// The response to an update request.  In streaming mode the server sends exactly one
+// response per request.
+message UpdateResponse {
+  // This is the request_id from the UpdateRequest, if it was set.
+  string request_id = 1;
+
+  // The update version assigned to the update request.
+  uint64 update_version = 2;
+
+  enum Status {
+    UNKNOWN = 0;          // the default
+    OK = 1;               // the update was successful
+    PARTIAL = 2;          // part of the request took effect, part failed (see errors)
+    // The request failed. If error is unset, the failure was per-document (see
+    // errors) and the request had no visible effect on the index. If error is
+    // set, the failure was request-level (e.g. commit pipeline) and the effect
+    // of individual documents is indeterminate beyond what errors lists.
+    ERROR = 3;
+  }
+
+  Status status = 3;
+
+  // ids of documents that were successfully indexed, if return_ids was set to true in the
+  // request.  In request order; failed documents are omitted (align against docs by
+  // skipping errors[].index).  A successfully indexed doc without a string/bytes id
+  // contributes an empty string.  Only meaningful when status is OK or PARTIAL; on a
+  // request-level ERROR the listed documents may have been rolled back.
+  repeated string ids = 4;
+
+  message DocError {
+    // the id of the failed document as given in the request (empty if absent or not a
+    // string/bytes value)
+    string id = 1;
+
+    // position of the failed document within the request's document list
+    int32 index = 2;
+    Error error = 3;
+  }
+
+  // Per-document failures.  A failed document has no effect on search results; the
+  // previous version of the document, if any, is untouched.
+  repeated DocError errors = 5;
+
+  // Number of failed documents.  Equals the length of errors unless the transport
+  // retained only a prefix (the NDJSON stream keeps the first 100 per group).
+  int64 total_errors = 7;
+
+  // Request-level failure (not tied to a single document), e.g. a failure in the commit
+  // pipeline.  Set exactly when status == ERROR for a non-document failure.
+  Error error = 6;
+}
+
+
+
+
+message Map {
+  // Unordered map of dynamically typed values.
+  map<string, Val> fields = 1;
+}
+
+message Val {
+  oneof kind {
+    // Represents a null value.
+    google.protobuf.NullValue null = 1;
+    string s = 2;
+    sint64 i = 3;
+    double d = 4;
+    float f = 5;
+    bool b = 6;
+    bytes bin = 7;
+    Map map = 8;
+    ArrVal arr = 9;
+    ArrStr arr_s = 10;
+    ArrInt arr_i = 11;
+    ArrFloat arr_f = 12;
+    ArrDouble arr_d = 13;
+    ArrBin arr_bin = 14;
+    Vector vec = 15;              // single dense vector (single-valued vector field, or one element)
+    ArrVector arr_vec = 16;       // list of vectors (multi-valued vector field per doc)
+    DocList docs = 100; // a list of documents, used for search results
+    FacetResult facet = 101; // result of a facet operation
+  }
+}
+
+message ArrVal {
+  // Repeated field of dynamically typed values.
+  repeated Val v = 1;
+}
+
+message ArrStr {
+  repeated string v = 1;
+}
+
+message ArrInt {
+  repeated sint64 v = 1;
+}
+
+message ArrFloat {
+  repeated float v = 1;
+}
+
+message ArrDouble {
+  repeated double v = 1;
+}
+
+message ArrBin {
+  repeated bytes v = 1;
+}
+
+// One array per document, used in columns for multi-valued string fields.
+message ArrArrStr {
+  repeated ArrStr v = 1;
+}
+
+message ArrArrInt {
+  repeated ArrInt v = 1;
+}
+
+message ArrArrFloat {
+  repeated ArrFloat v = 1;
+}
+
+message ArrArrDouble {
+  repeated ArrDouble v = 1;
+}
+
+// A dense vector value. Dimensionality is the number of elements in f32.v.
+message Vector {
+  oneof kind {
+    ArrFloat f32 = 1;
+  }
+}
+
+// A list of vectors, used as a per-doc cell for multi-valued vector fields.
+message ArrVector {
+  repeated Vector v = 1;
+}
+
+message ColStr {
+  // "" unless a real empty string occurs in the batch, in which case a
+  // string greater than every batch value is used (see the
+  // ColInt.missing_val sentinel note; the check is exact).
+  string missing_val = 1;
+  repeated string v = 2;
+}
+
+// One slot per document, including missing values, aligned with DocList rows.
+// Scalar columns use missing_val; multi-valued columns use empty arrays.
+// Vector columns use the missing-value rules described on their fields.
+message Column {
+  oneof kind {
+    ColStr col_s = 1;
+    ColInt col_i = 2;
+    ColFloat col_f = 3;
+    ColDouble col_d = 4;
+    ArrArrStr multi_s = 5;
+    ArrArrInt multi_i = 6;
+    ArrArrFloat multi_f = 7;
+    ArrArrDouble multi_d = 8;
+
+    ColVector col_vec = 16;    // single-valued vector column: one Vector per doc; missing = unset oneof
+    MultiVector multi_vec = 17; // multi-valued vector column: one ArrVector per doc; missing = empty list
+  }
+}
+
+// Single-valued vector column.  Each Vector slot is independently nullable
+// via its empty oneof - no separate missing_val needed.
+message ColVector {
+  repeated Vector v = 1;
+}
+
+// Multi-valued vector column.  Empty ArrVector means "doc does not have the
+// field"; absence is indistinguishable from an empty list, which matches the
+// indexing behavior (an empty list of vectors is not stored).
+message MultiVector {
+  repeated ArrVector v = 1;
+}
+
+message ColInt {
+  // Sentinel for documents without a value. Chosen per column per batch so
+  // it never equals a present value: v[i] == missing_val means missing.
+  // HTTP JSON represents missing values as null.
+  sint64 missing_val = 1;
+  repeated sint64 v = 2;
+}
+
+message ColFloat {
+  // Chosen per batch like ColInt.missing_val (the check is exact).  Never
+  // NaN (it compares unequal to itself); +0.0/-0.0 are treated as one value
+  // when choosing.
+  float missing_val = 1;
+  repeated float v = 2;
+}
+
+message ColDouble {
+  // See ColFloat.missing_val.
+  double missing_val = 1;
+  repeated double v = 2;
+}
+
+message CreateCollectionRequest {
+  string name = 1;
+  SchemaDef schema = 2;
+}
+
+message CreateCollectionResponse {
+  string name = 1;
+}
+
+message DeleteCollectionRequest {
+  string name = 1;
+}
+
+message DeleteCollectionResponse {
+  string name = 1;
+}
+
+// Names of every collection on the node, sorted. HTTP-only: GET or POST
+// /collections/_list, also available as GET /collections.
+message ListCollectionsResponse {
+  repeated string collections = 1;
+}
+
+// Operational statistics. An empty collection requests every
+// collection on the node; per-segment records are opt-in because they are the
+// only unbounded part of the response.
+message StatsRequest {
+  string collection = 1; // empty selects every collection
+  bool segments = 2;
+}
+
+message StatsResponse {
+  StatsTotals totals = 1;
+  repeated CollectionStats collections = 2;
+  IndexRamStats indexing_ram = 3;
+}
+
+// Rolled-up counts.  Only the fields meaningful at a given level are set, so
+// "collections" appears only on the node total and "shards" only on node and
+// collection totals.  Absent means zero (proto3 JSON omits defaults).
+message StatsTotals {
+  uint64 collections = 1;
+  uint64 shards = 2;
+  uint64 segments = 3;
+  uint64 committed_segments = 4;
+  uint64 max_docs = 5;
+  uint64 live_docs = 6;
+  uint64 deleted_docs = 7;
+  uint64 bytes = 8;  // on-disk bytes; the index level reports the whole directory including metadata and in-flight files
+}
+
+message CollectionStats {
+  string name = 1;
+  StatsTotals totals = 2;
+  string schema_gen = 3;  // sortable-string spelling (see SegmentStats); empty = no schema
+  repeated ShardStats shards = 4;
+
+  // Set for a collection that is not serving (failed to load, or a delete failed
+  // partway); kind is UNAVAILABLE and the message is the recorded reason.
+  Error error = 5;
+}
+
+message ShardStats {
+  uint32 shard_id = 1;
+  IndexStats index = 2;
+}
+
+message IndexStats {
+  StatsTotals totals = 10;   // counts for this index alone
+  uint64 commit_time = 1; // microseconds since the Unix epoch
+  uint64 index_gen = 2;
+  uint64 core_gen = 3;
+  uint64 update_version = 4;
+  string schema_gen = 5;  // sortable-string spelling (see SegmentStats); empty = no schema
+  uint64 active_merges = 6;
+  repeated AuxStats aux_indexes = 7;
+  QueryCacheStats query_cache = 8;
+  repeated SegmentStats segments = 9;
+}
+
+// Ids and generations that appear in filenames are reported in their
+// filesystem spelling so stats output correlates directly with directory
+// listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"),
+// while generations are the length-prefixed base36 sortable strings embedded
+// in filenames (e.g. live_gen "01" -> file "s0a__L01", schema_gen "02" ->
+// file "_schema_02").  Sortable strings order the same as the numbers they
+// encode, so lexicographic comparison remains valid.  Empty (omitted in JSON)
+// means none.  Generations that never appear on disk (index_gen, core_gen,
+// update_version) stay numeric.
+message SegmentStats {
+  string seg = 1;
+  string live_gen = 2;
+  uint64 min_update_version = 3;
+  uint64 max_update_version = 4;
+  uint64 first_commit_time = 5; // microseconds since the Unix epoch
+  int32 max_doc = 6;
+  int32 live_docs = 7;
+  int32 deleted_docs = 8;
+  string schema_gen = 9;
+  bool committed = 10;
+  bool merging = 11;
+  uint32 merge_level = 12;
+  repeated AuxStats overlays = 13;
+  uint64 bytes = 14;
+}
+
+message AuxStats {
+  string kind = 1;
+  string field = 2;
+  string name = 3;
+  string gen = 4;  // sortable-string spelling as embedded in the files' names (see SegmentStats)
+  uint64 commit_time = 5; // microseconds since the Unix epoch
+  uint64 built_core_gen = 6;
+  repeated string files = 7;
+  uint64 bytes = 8;  // bytes of this entry's files; informational, already counted under its segment
+}
+
+message QueryCacheStats {
+  bool enabled = 1;
+  uint64 max_bytes = 2;
+  uint64 resident_bytes = 3;
+  uint64 metadata_bytes = 4;
+  uint64 hits = 5;
+  uint64 misses = 6;
+  uint64 admissions = 7;
+  uint64 builds = 8;
+  uint64 byproduct_inserts = 9;
+  uint64 publish_rejects = 10;
+  uint64 evictions = 11;
+  uint64 purges = 12;
+  uint64 oversized_key_bypasses = 13;
+  uint64 reader_stable_hits = 14;
+  uint64 reader_stable_refreshes = 15;
+  uint64 reader_stable_retires = 16;
+}
+
+message IndexRamStats {
+  uint64 limit_bytes = 1;
+  uint64 reserved_bytes = 2;
+}
+
+// Admin control over the per-collection query cache. Actions compose and
+// apply in this order: flush, reset_admission, reset_counters, then dump.
+// flush drops resident values and entry metadata; sighting history survives,
+// so a known query can be readmitted and rebuilt immediately.
+// flush + reset_admission also forgets sightings, restarting admission
+// tracking. reset_counters zeroes the cumulative stats.
+// An empty collection targets every collection.
+message CacheControlRequest {
+  string collection = 1; // empty selects every collection
+  bool flush = 2;
+  bool reset_admission = 3;
+  bool reset_counters = 4;
+  bool dump = 5;
+  uint32 dump_limit = 6;  // max dump rows per shard; 0 = 100
+}
+
+// One resident cache entry. key_text is the printable-byte extraction from
+// the serialized key (field names and terms survive; structure bytes do
+// not); key_hash is a diagnostic fingerprint. bytes counts resident value
+// payloads; segments_resident counts slots currently holding a value;
+// reader_value marks a whole-reader live-exact value.
+message CacheEntryDump {
+  uint64 key_hash = 1;
+  uint32 key_bytes = 2;
+  string key_text = 3;
+  string scope = 4;  // SEGMENT_STABLE | CORE_STABLE | READER_STABLE
+  bool reader_value = 5;
+  uint64 bytes = 6;
+  uint32 segments_resident = 7;
+  uint64 hits = 8;
+  uint64 last_used_epoch = 9;
+}
+
+message ShardCacheControl {
+  uint32 shard_id = 1;
+  QueryCacheStats stats = 2;  // gathered after the requested actions
+  repeated CacheEntryDump entries = 3;  // largest payload first, capped
+  uint64 entries_resident = 4;  // uncapped resident-entry count at dump time
+}
+
+message CollectionCacheControl {
+  string name = 1;
+  repeated ShardCacheControl shards = 2;
+  Error error = 3;  // as CollectionStats.error
+}
+
+message CacheControlResponse {
+  repeated CollectionCacheControl collections = 1;
+}
+
+//
+// Schema
+//
+
+// One analysis-chain component - a tokenizer or a token filter - named by its
+// registry name, plus its parameters.  params values are typed JSON values
+// (string, number, bool, string list), e.g. {"possessive": false} for kstem.
+// A component that takes no parameters rejects any. The JSON dialect accepts a
+// bare string for a parameterless component: "lowercase" == {"name": "lowercase"}.
+message AnalyzerComponent {
+  string name = 1;               // e.g., "unicode_word", "nfkc_cf"
+  map<string, Val> params = 2;
+}
+
+message AnalyzerDef {
+  AnalyzerComponent tokenizer = 1;         // "whitespace" (default when absent), "keyword", "unicode_word"
+  repeated AnalyzerComponent filters = 2;  // applied in order, e.g., ["nfkc_cf", "fold"]
+}
+
+// Alternate representations of the same input value, keyed by local label.
+// Absent inherits the parent's variants; present replaces the whole map;
+// empty clears it. HTTP JSON represents this directly as an object.
+message FieldVariants {
+  // Each representation is addressed as <field>__<label>. Variant definitions
+  // may inherit physical settings through parent, but cannot set multi,
+  // stored, stored_resource, variants, or defaults. All representations share
+  // the logical field's scalar, vector, or geographic shape.
+  map<string, FieldDef> entries = 1;
+}
+
+// Default representations for bare field names. Each binding names "self"
+// or a local variant label. Absent inherits the parent's defaults; present
+// replaces both bindings. An omitted value binding on a TEXT primary selects
+// its sole STRING variant; an omitted search binding on a STRING primary
+// selects its sole TEXT variant. Multiple candidates require an explicit
+// binding. With no candidate, or for other type combinations, use self.
+// Inference uses resolved types; operations still check index/column support.
+// Explicit <field>__<label> and <field>__self selectors bypass these defaults.
+message FieldDefaults {
+  // Match, phrase, simple query, expression terms, prefix, fuzzy, wildcard,
+  // and regex queries, including their use in filters.
+  optional string search = 1;
+
+  // AnyOfQuery, ranges, field/range facets, sorts, and column expressions.
+  // Bare field names in retrieval, exists, kNN, and geo use the primary.
+  optional string value = 2;
+}
+
+// Whole-value STRING normalization using a keyword input and only normalizing
+// filters. Absent inherits; present replaces; empty clears. HTTP JSON uses
+// an array of components, e.g. ["nfkc_cf", "fold"]. Applied at ingest and
+// to query literals and facet selections.
+message NormalizerDef {
+  repeated AnalyzerComponent filters = 1;
+}
+
+// Vector similarity metric.  NONE = storage-only, not kNN-searchable;
+// L2 / IP / COSINE select the metric for exact column search and any
+// ANN index.
+enum VectorMetric {
+  NONE = 0;
+  L2 = 1;
+  IP = 2;
+  COSINE = 3;
+}
+
+// A field, template, or variant definition, named by its enclosing map key.
+// Unset properties inherit from parent, then use type defaults, except as
+// documented on individual properties. HTTP JSON enum values are lowercase.
+message FieldDef {
+  string parent = 1;            // inherit properties from this field or template
+
+  enum FieldClass {
+    STRING = 0;    // unanalyzed string
+    TEXT = 1;      // analyzed text
+    INT = 2;
+    FLOAT = 3;
+    DOUBLE = 4;
+    ID = 6;        // document identifier used for replacement and deletion
+    VECTOR = 7;    // dense float vector
+    DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
+    GEO_POINT = 9; // latitude/longitude point
+  }
+  optional FieldClass type = 2; // required unless inherited from parent
+
+  // Index acceleration. Numeric Match/Range and geographic predicates can
+  // scan a column with NONE. Term queries on STRING/TEXT/ID require MATCH;
+  // STRING columns alone do not provide term-query support.
+  enum IndexMode {
+    NONE = 0;    // no index
+    MATCH = 1;   // term index for STRING/TEXT/ID, including term ranges
+    RANGE = 2;   // numeric Match/Range or GEO_POINT predicates; requires column=true
+  }
+
+  // Unset inherits, falling back to MATCH for STRING/TEXT/ID and NONE
+  // for other types. Other type/mode combinations are rejected.
+  optional IndexMode index = 3;
+
+  optional bool column = 4;      // store values in a per-field column
+  optional bool multi = 5;       // multi-valued
+
+  // TEXT only. Unset or empty inherits; a nonempty definition replaces the
+  // entire analyzer. Without an inherited analyzer, defaults to whitespace.
+  AnalyzerDef analyzer = 6;
+
+  // Keep canonical source text before analysis/normalization for TEXT/STRING/ID
+  // retrieval. Defaults to true for TEXT, false otherwise; unused on other types.
+  optional bool stored = 7;
+
+  // Stored-field group for stored TEXT/STRING/ID values, e.g. "_stored_body_".
+  // Empty or unset inherits the parent's group, falling back to "_stored_".
+  optional string stored_resource = 8;
+
+  // --- VECTOR fields ---
+
+  // Vector dimensionality. Unset inherits, falling back to 0 (infer
+  // from the first indexed value). A positive value enforces dimensions at ingest.
+  optional int32 dims = 9;
+
+  // Vector similarity metric.  Absent means inherit, else NONE (storage-only).
+  optional VectorMetric metric = 10;
+
+  // Caller asserts that all values for this field are already L2-normalized
+  // (unit length).  For COSINE, this disables write-time and aux-build
+  // normalization.  No effect on non-COSINE metrics.  Trust-only: not
+  // validated at index time.
+  optional bool normalized = 11;
+
+  // For COSINE fields, normalize vectors before storing them in the column.
+  // If unset, COSINE defaults to true unless normalized is true; other metrics
+  // default to false.  A cosine field skips and logs zero / near-zero vectors
+  // when normalized is false.
+  optional bool normalize_on_write = 12;
+
+  FieldVariants variants = 13; // alternate representations of this logical field
+  FieldDefaults defaults = 14; // default search and value representations
+  NormalizerDef normalizer = 15; // whole-value STRING normalization
+
+  // Policy for indexed terms longer than 255 bytes: STRING after normalization,
+  // TEXT after analysis, and IDs. Exact query values use the same policy.
+  // Not valid on column-only STRING or other types. Changes do not rewrite
+  // existing terms. See docs/guide/schema.md for ordering and query implications.
+  enum LongTerms {
+    TRUNCATE = 0; // keep a UTF-8-safe prefix of at most 255 bytes; values may merge
+    REJECT = 1;   // reject overlong terms
+    HASH128 = 2;  // prefix of at most 230 bytes plus 25 base36 hash digits
+  }
+  optional LongTerms long_terms = 16; // absent: inherit from parent, else hash128
+}
+
+message SchemaDef {
+  // Concrete fields, keyed by field name.  Exact-name lookup consults only this
+  // map.  The reserved "id" and "_version_" fields are always materialized: a
+  // REPLACE_ALL that omits them gets the defaults; redefining them incompatibly, or
+  // defining a second ID-class field, is an error.
+  map<string, FieldDef> fields = 1;
+
+  // Abstract definitions, keyed by template name.  Never directly usable as a
+  // doc field; suffix matching ("title_w" -> "_w") consults only this map, and
+  // any field/template may name one as parent.  A name in both maps is an error.
+  map<string, FieldDef> templates = 2;
+}
+
+message SchemaRequest {
+  string collection = 1; // empty selects the default collection, "main"
+
+  enum Mode {
+    // Each named definition is SET to exactly the request's definition
+    // (whole-definition, never a property-level merge); definitions not named
+    // in the request are untouched.
+    SET = 0;
+
+    // Replace the entire schema with this definition (the reserved id and
+    // _version_ fields are materialized when omitted).
+    REPLACE_ALL = 1;
+  }
+  Mode mode = 2;
+  SchemaDef schema = 3;
+}
+
+message SchemaResponse {
+  SchemaDef schema = 1;         // the resulting schema after the operation
+}
