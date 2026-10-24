@@ -86,3 +86,64 @@ func toVal(v any) (*luxirpb.Val, error) {
 		return nil, fmt.Errorf("insupported type %T", v)
 	}
 }
+
+// fromVal ;; Change a protobuf *Val to a native value, the inverse of toVal
+//
+// ;; ints come back as int64 and int arrays as []int64, whatever went in
+func fromVal(v *luxirpb.Val) (any, error) {
+	switch x := v.GetKind().(type) {
+	case nil, *luxirpb.Val_Null:
+		return nil, nil
+	case *luxirpb.Val_S:
+		return x.S, nil
+	case *luxirpb.Val_B:
+		return x.B, nil
+	case *luxirpb.Val_Bin:
+		return x.Bin, nil
+	case *luxirpb.Val_I:
+		return x.I, nil
+	case *luxirpb.Val_F:
+		return x.F, nil
+	case *luxirpb.Val_D:
+		return x.D, nil
+	case *luxirpb.Val_ArrS:
+		return x.ArrS.GetV(), nil
+	case *luxirpb.Val_ArrI:
+		return x.ArrI.GetV(), nil
+	case *luxirpb.Val_ArrF:
+		return x.ArrF.GetV(), nil
+	case *luxirpb.Val_ArrD:
+		return x.ArrD.GetV(), nil
+	case *luxirpb.Val_ArrBin:
+		return x.ArrBin.GetV(), nil
+	case *luxirpb.Val_Vec:
+		return x.Vec.GetF32().GetV(), nil
+	case *luxirpb.Val_Arr:
+		out := make([]any, len(x.Arr.GetV()))
+		for i, e := range x.Arr.GetV() {
+			val, err := fromVal(e)
+			if err != nil {
+				return nil, fmt.Errorf("element %d: %w", i, err)
+			}
+			out[i] = val
+		}
+		return out, nil
+	case *luxirpb.Val_Map:
+		return fromMap(x.Map)
+	default:
+		return nil, fmt.Errorf("unsupported value %T", x)
+	}
+}
+
+// fromMap ;; Change a protobuf *Map to a Document, the inverse of Document.toMap
+func fromMap(m *luxirpb.Map) (Document, error) {
+	d := make(Document, len(m.GetFields()))
+	for name, v := range m.GetFields() {
+		val, err := fromVal(v)
+		if err != nil {
+			return nil, fmt.Errorf("field: %q: %w", name, err)
+		}
+		d[name] = val
+	}
+	return d, nil
+}

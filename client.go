@@ -14,9 +14,10 @@ const DefaultAddr = "localhost:9401"
 
 // Luxir ;;
 type Luxir struct {
-	conn    *grpc.ClientConn
-	health  grpc_health_v1.HealthClient
-	indexer luxirpb.IndexerClient
+	conn     *grpc.ClientConn
+	health   grpc_health_v1.HealthClient
+	indexer  luxirpb.IndexerClient
+	searcher luxirpb.SearcherClient
 }
 
 // NewLuxir ;; Get a new instance of *Luxir by the provided addr
@@ -33,9 +34,10 @@ func NewLuxir(addr string) (*Luxir, error) {
 	}
 
 	return &Luxir{
-		conn:    conn,
-		health:  grpc_health_v1.NewHealthClient(conn),
-		indexer: luxirpb.NewIndexerClient(conn),
+		conn:     conn,
+		health:   grpc_health_v1.NewHealthClient(conn),
+		indexer:  luxirpb.NewIndexerClient(conn),
+		searcher: luxirpb.NewSearcherClient(conn),
 	}, nil
 }
 

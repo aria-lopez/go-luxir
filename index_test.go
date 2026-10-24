@@ -16,8 +16,6 @@ import (
 )
 
 // newCollection ;; a unique collection name for one test, deleted when the test ends
-//
-// ;; a fresh name per test keeps tests from seeing each other's documents
 func newCollection(t *testing.T, l *Luxir) string {
 	t.Helper()
 
@@ -25,7 +23,6 @@ func newCollection(t *testing.T, l *Luxir) string {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		// ;; the collection only exists if the test wrote to it, so ignore NOT_FOUND
 		luxirpb.NewAdminClient(l.conn).DeleteCollection(ctx, &luxirpb.DeleteCollectionRequest{Name: name})
 	})
 
@@ -33,8 +30,6 @@ func newCollection(t *testing.T, l *Luxir) string {
 }
 
 // liveDocs ;; committed, undeleted document count Luxir reports for a collection
-//
-// ;; there is no Search method yet, so Stats is how the tests see what landed
 func liveDocs(t *testing.T, l *Luxir, collection string) uint64 {
 	t.Helper()
 
