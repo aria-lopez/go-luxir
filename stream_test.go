@@ -6,16 +6,20 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"math"
+	"math/rand/v2"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/aria-lopez/go-luxir/luxirpb"
 )
@@ -124,10 +128,17 @@ func TestIndexStream_AllOrNoneIsPerBatch(t *testing.T) {
 
 	var ie *IndexError
 	if !errors.As(err, &ie) || !ie.IsPartial() {
-		t.Fatalf("err = %v, want PARTIAL: the first batch is kept, the second rolled back", err)
+		t.Fatalf("err = %v, want PARTIAL: the bad document's batch rolled back, the others kept", err)
 	}
-	if n := liveDocs(t, l, coll); n != streamBatchDocs {
-		t.Errorf("live docs = %d, want %d", n, streamBatchDocs)
+	if n := liveDocs(t, l, coll); n == 0 || n >= 1499 {
+		t.Errorf("live docs = %d, want every batch but the bad one's", n)
+	}
+	r, err := l.Search(timeout(t), coll, nil, WithLimit(-1), WithFields("id"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uint64(len(r.Hits)) != liveDocs(t, l, coll) {
+		t.Errorf("search sees %d docs, stats %d", len(r.Hits), liveDocs(t, l, coll))
 	}
 }
 
@@ -146,8 +157,11 @@ func TestIndexStream_ConvertErrorStopsWithoutCommit(t *testing.T) {
 	if resp == nil || ie.Resp != resp {
 		t.Errorf("resp = %v, want the merged response so far, also on the error", resp)
 	}
-	if n := liveDocs(t, l, coll); n != 0 {
-		t.Errorf("live docs = %d, want nothing committed", n)
+	st, err := l.Stats(timeout(t), coll, false)
+	if err == nil && st.GetCollections()[0].GetTotals().GetLiveDocs() != 0 {
+		t.Errorf("live docs = %d, want nothing committed", st.GetCollections()[0].GetTotals().GetLiveDocs())
+	} else if err != nil && !errors.Is(err, ErrCollectionNotFound) {
+		t.Errorf("Stats: %v", err)
 	}
 }
 
@@ -273,47 +287,205 @@ func TestIndexStream_FakeRequests(t *testing.T) {
 }
 
 func TestIndexStream_FakeOutOfOrder(t *testing.T) {
+	var streams atomic.Int32
 	l := fakeIndexerLuxir(t, func(s updateStream) error {
-		var held []*luxirpb.UpdateRequest
+		streams.Add(1)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		defer wg.Wait()
 		for {
 			r, err := s.Recv()
 			if err != nil {
 				return nil
 			}
-			if r.GetRequestId() == commitRequestID {
-				s.Send(&luxirpb.UpdateResponse{RequestId: commitRequestID, Status: luxirpb.UpdateResponse_OK, UpdateVersion: 9})
-				continue
-			}
-			held = append(held, r)
-			if len(held) < 2 {
-				continue
-			}
-			for i := len(held) - 1; i >= 0; i-- {
-				h := held[i]
-				resp := &luxirpb.UpdateResponse{RequestId: h.GetRequestId(), Status: luxirpb.UpdateResponse_PARTIAL, UpdateVersion: uint64(i + 1),
-					Ids: []string{"id" + h.GetRequestId()}, TotalErrors: 1,
-					Errors: []*luxirpb.UpdateResponse_DocError{{Id: "x", Index: 1}}}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				time.Sleep(time.Duration(rand.IntN(3000)) * time.Microsecond)
+				resp := &luxirpb.UpdateResponse{RequestId: r.GetRequestId(), Status: luxirpb.UpdateResponse_OK, UpdateVersion: 9}
+				if r.GetCommit() == nil {
+					resp.Status = luxirpb.UpdateResponse_PARTIAL
+					resp.UpdateVersion = 1
+					for i, d := range r.GetDocs() {
+						id := d.GetFields()["id"].GetS()
+						if i == 1 {
+							resp.Errors = append(resp.Errors, &luxirpb.UpdateResponse_DocError{Id: id, Index: 1})
+							resp.TotalErrors++
+							continue
+						}
+						resp.Ids = append(resp.Ids, id)
+					}
+				}
+				mu.Lock()
+				defer mu.Unlock()
 				s.Send(resp)
-			}
+			}()
 		}
 	})
+	docs := numbered(9000)
 
-	resp, err := l.IndexStream(timeout(t), "c", slices.Values(numbered(1500)), WithCommit())
+	resp, err := l.IndexStream(timeout(t), "c", slices.Values(docs), WithCommit(), WithReturnIDs())
 
 	var ie *IndexError
 	if !errors.As(err, &ie) || !ie.IsPartial() {
 		t.Fatalf("err = %v, want PARTIAL", err)
 	}
-	if !reflect.DeepEqual(resp.GetIds(), []string{"id0", "id1"}) {
-		t.Errorf("ids = %v, want batch order whatever the reply order", resp.GetIds())
+	if streams.Load() != streamLanes {
+		t.Errorf("opened %d streams, want %d", streams.Load(), streamLanes)
 	}
-	var at []int32
-	for _, e := range resp.GetErrors() {
-		at = append(at, e.GetIndex())
+	failed := map[int]bool{}
+	for i, e := range resp.GetErrors() {
+		if docs[e.GetIndex()]["id"] != e.GetId() {
+			t.Fatalf("error %d at position %d names %q, but that document is %v", i, e.GetIndex(), e.GetId(), docs[e.GetIndex()]["id"])
+		}
+		if i > 0 && e.GetIndex() <= resp.GetErrors()[i-1].GetIndex() {
+			t.Errorf("errors not in document order at %d", i)
+		}
+		failed[int(e.GetIndex())] = true
 	}
-	slices.Sort(at)
-	if !reflect.DeepEqual(at, []int32{1, 1001}) || resp.GetTotalErrors() != 2 || resp.GetUpdateVersion() != 9 {
-		t.Errorf("errors at %v total %d version %d, want [1 1001], 2, 9", at, resp.GetTotalErrors(), resp.GetUpdateVersion())
+	var want []string
+	for i, d := range docs {
+		if !failed[i] {
+			want = append(want, d["id"].(string))
+		}
+	}
+	if !reflect.DeepEqual(resp.GetIds(), want) {
+		t.Errorf("ids = %d, want the %d successful ids in document order", len(resp.GetIds()), len(want))
+	}
+	if int64(len(failed)) != resp.GetTotalErrors() || len(failed) < 9 || resp.GetUpdateVersion() != 9 {
+		t.Errorf("%d failed, total %d, version %d", len(failed), resp.GetTotalErrors(), resp.GetUpdateVersion())
+	}
+}
+
+func TestIndexStream_WhenItGoesParallel(t *testing.T) {
+	tests := []struct {
+		name   string
+		opts   []UpdateOption
+		create error
+		want   int32
+	}{
+		{"plain", nil, nil, streamLanes},
+		{"collection already there", nil, status.Error(codes.AlreadyExists, "exists"), streamLanes},
+		{"other settings", []UpdateOption{WithAllOrNone(), WithReturnIDs()}, nil, streamLanes},
+		{"field map", []UpdateOption{WithFieldMap(map[string]string{"key": "id"})}, nil, 1},
+		{"drop unmapped", []UpdateOption{WithDropUnmapped()}, nil, 1},
+		{"can't make the collection", nil, status.Error(codes.FailedPrecondition, "read only"), 1},
+		{"no admin service", nil, status.Error(codes.Unimplemented, "nope"), 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var used atomic.Int32
+			l := fakeIndexerAdminLuxir(t, func(s updateStream) error {
+				counted := false
+				for {
+					r, err := s.Recv()
+					if err != nil {
+						return nil
+					}
+					if !counted && r.GetCommit() == nil {
+						counted = true
+						used.Add(1)
+					}
+					s.Send(&luxirpb.UpdateResponse{RequestId: r.GetRequestId(), Status: luxirpb.UpdateResponse_OK})
+				}
+			}, tt.create)
+			if _, err := l.IndexStream(timeout(t), "c", slices.Values(numbered(400)), tt.opts...); err != nil {
+				t.Fatal(err)
+			}
+			if used.Load() != tt.want {
+				t.Errorf("documents went down %d streams, want %d", used.Load(), tt.want)
+			}
+		})
+	}
+}
+
+func TestIndexStream_NothingToSendMakesNothing(t *testing.T) {
+	l := getClient(t)
+	coll := newCollection(t, l)
+
+	if _, err := l.IndexStream(timeout(t), coll, slices.Values([]Document{})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Stats(timeout(t), coll, false); !errors.Is(err, ErrCollectionNotFound) {
+		t.Errorf("Stats = %v, want the collection never made by an empty stream", err)
+	}
+}
+
+func TestLaneOf(t *testing.T) {
+	rr := 0
+	same := []Document{{"id": "123"}, {"id": 123}, {"id": int64(123)}, {"id": int32(123)}, {"id": uint16(123)}, {"id": []byte("123")}}
+	for _, d := range same {
+		if got, want := laneOf(d, streamLanes, &rr), laneOf(same[0], streamLanes, &rr); got != want {
+			t.Errorf("laneOf(%#v) = %d, want %d: the same id must take the same stream", d["id"], got, want)
+		}
+	}
+	hit := map[int]int{}
+	for i := range 4000 {
+		hit[laneOf(Document{"id": fmt.Sprintf("doc-%d", i)}, streamLanes, &rr)]++
+		hit[laneOf(Document{"t_s": "no id"}, streamLanes, &rr)]++
+	}
+	for lane := range streamLanes {
+		if hit[lane] < 1500 {
+			t.Errorf("lane %d got %d of 8000 documents, want them spread out", lane, hit[lane])
+		}
+	}
+	if laneOf(Document{"id": "x"}, 1, &rr) != 0 {
+		t.Error("one lane must always be lane 0")
+	}
+}
+
+func TestIndexStream_SameIDLastWins(t *testing.T) {
+	l := getClient(t)
+	coll := newCollection(t, l)
+	docs := make([]Document, 30000)
+	for i := range docs {
+		var id any = fmt.Sprintf("k%d", i%500)
+		if i%500 == 7 && i%1000 < 500 {
+			id = 7000 + i%3
+		}
+		docs[i] = Document{"id": id, "n_i": i}
+	}
+	docs[len(docs)-1] = Document{"id": "k499", "n_i": -1}
+
+	if _, err := l.IndexStream(timeout(t), coll, slices.Values(docs), WithCommit()); err != nil {
+		t.Fatalf("IndexStream: %v", err)
+	}
+
+	last := map[string]int64{}
+	for _, d := range docs {
+		last[fmt.Sprint(d["id"])] = int64(d["n_i"].(int))
+	}
+	r, err := l.Search(timeout(t), coll, nil, WithLimit(-1), WithFields("id", "n_i"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Hits) != len(last) {
+		t.Errorf("got %d docs, want %d distinct ids", len(r.Hits), len(last))
+	}
+	for _, h := range r.Hits {
+		if id := fmt.Sprint(h.Doc["id"]); h.Doc["n_i"] != last[id] {
+			t.Errorf("id %s has n_i %v, want the last version %d", id, h.Doc["n_i"], last[id])
+		}
+	}
+}
+
+func TestIndexStream_ManyLargeIDs(t *testing.T) {
+	l := getClient(t)
+	coll := newCollection(t, l)
+	pad := strings.Repeat("p", 200)
+	docs := make([]Document, 120000)
+	for i := range docs {
+		docs[i] = Document{"id": fmt.Sprintf("%s%07d", pad, i)}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	resp, err := l.IndexStream(ctx, coll, slices.Values(docs), WithReturnIDs(), WithCommit())
+	if err != nil {
+		t.Fatalf("IndexStream: %v", err)
+	}
+	if len(resp.GetIds()) != len(docs) || resp.GetIds()[0] != docs[0]["id"] || resp.GetIds()[len(docs)-1] != docs[len(docs)-1]["id"] {
+		t.Errorf("got %d ids, want all %d in order", len(resp.GetIds()), len(docs))
 	}
 }
 
@@ -404,7 +576,7 @@ func TestStreamMerge_Status(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := &streamMerge{}
+			m := newStreamMerge()
 			for _, a := range tt.acks {
 				m.add(a)
 			}
@@ -412,5 +584,50 @@ func TestStreamMerge_Status(t *testing.T) {
 				t.Errorf("status = %s, want %s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMapBound_NeverUnder(t *testing.T) {
+	docs := []Document{
+		{},
+		{"id": "a"},
+		{"s": strings.Repeat("x", 300), "big": strings.Repeat("y", 70000), "empty": ""},
+		{"i": int64(math.MinInt64), "j": int64(math.MaxInt64), "k": -1, "b": true, "n": nil, "f": float32(1.5), "d": 2.5},
+		{"bin": []byte("raw"), "bins": [][]byte{[]byte("a"), make([]byte, 200)}},
+		{"ss": []string{"", "a", strings.Repeat("z", 1000)}, "is": []int64{math.MinInt64, -1, 0, math.MaxInt64}, "fs": []float32{1, 2}, "ds": []float64{1, 2, 3}},
+		{"vec": []float32{1, 2, 3, 4}, "mv": [][]float32{{1, 2}, {}, {3, 4, 5}}, "pt": Point{Lat: 1, Lon: 2}, "pts": []Point{{1, 2}, {3, 4}}},
+		{"mixed": []any{"a", int64(-5), 2.5, []string{"x"}, []any{"deep", []any{int64(1)}}}, "when": time.Now()},
+	}
+	for i := 0; i < 50; i++ {
+		d := Document{}
+		for j := 0; j < 20; j++ {
+			d[fmt.Sprintf("f%d_%s", j, strings.Repeat("k", i))] = []any{strings.Repeat("v", i*j), int64(-i * j), float64(j)}
+		}
+		docs = append(docs, d)
+	}
+	for i, d := range docs {
+		m, err := d.toMap()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, real := mapBound(m), proto.Size(m); got < real {
+			t.Errorf("doc %d: bound %d is under the real size %d", i, got, real)
+		}
+	}
+}
+
+func TestIndexStream_NewCollectionsDontHang(t *testing.T) {
+	l := getClient(t)
+	ctx := context.Background()
+	for i := range 1500 {
+		coll := fmt.Sprintf("go_luxir_new_%d_%d", time.Now().UnixNano(), i)
+		docs := numbered(2 + i%7)
+		c, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, err := l.IndexStream(c, coll, slices.Values(docs))
+		cancel()
+		l.DeleteCollection(ctx, coll)
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
 	}
 }

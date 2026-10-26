@@ -148,9 +148,9 @@ resp, err = l.Delete(ctx, "books", []string{"b1", "b2"}, luxir.WithCommit())
 resp, err = l.Commit(ctx, "books")
 ```
 
-`IndexStream` takes an `iter.Seq[luxir.Document]`, so it can also read from a file or a channel without holding everything in memory. The response merges every batch, and its error positions refer to your sequence.
+`IndexStream` takes an `iter.Seq[luxir.Document]`, so it can also read from a file or a channel without holding everything in memory. It sends batches over several parallel streams (roughly 3x faster than one), and every document with the same id goes down the same stream, so the last version still wins. The response merges every batch, and its error positions and returned ids follow your sequence.
 
-Writing to a collection that doesn't exist creates it with Luxir's default schema.
+Writing to a collection that doesn't exist creates it with Luxir's default schema. If you'll write to a new collection from several goroutines at once, make it first with `CreateCollection`: Luxir 0.1.0 can stall simultaneous writes into a collection that a write has only just created. `IndexStream` does this for you.
 
 Update options (for `Index`, `IndexStream`, `Delete` and `Commit`):
 
@@ -384,6 +384,21 @@ res, err := l.Search(ctx, "books", luxir.Raw(q))
 
 resp, err := l.CacheControl(ctx, &luxirpb.CacheControlRequest{Collection: "books", Flush: true})
 ```
+
+## performance
+
+Measured against a local Luxir 0.1.0 node (RAM storage), with the client and the server on the same AMD Ryzen 5 1600X (6 cores / 12 threads). There were 100k documents of 6 fields each, and 16 workers for throughput. "Raw gRPC" is hand-written code on the generated stubs, and "HTTP" is Luxir's JSON API through Go's `net/http`. Your numbers will differ. The point is the comparison.
+
+| | go-luxir | raw gRPC | HTTP |
+|---|---|---|---|
+| bulk ingest | **~330k docs/s** (`IndexStream`) | ~150k docs/s (one `UpdateStream`) | ~225k docs/s (NDJSON stream) |
+| ingest, 1000-doc calls | ~88k docs/s (`Index`) | ~82k docs/s | ~120k docs/s |
+| top-10 search, p50 | ~460 µs | ~400 µs | ~290 µs |
+| search throughput | ~10k/s | ~10k/s | ~22k/s |
+| facet search, p50 | ~340 µs | ~300 µs | ~240 µs |
+| export everything | ~135k docs/s (`Scan`) | ~150k docs/s | ~178k docs/s (NDJSON) |
+
+`IndexStream` is the fastest way to load data, because it spreads batches over parallel streams that Luxir indexes concurrently. For searches, the client adds a few tens of microseconds over hand-written gRPC, almost all of it turning results into Go values. Luxir currently answers small searches faster over HTTP than over gRPC, whatever the client.
 
 ## tests
 

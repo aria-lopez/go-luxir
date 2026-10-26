@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"iter"
+	"slices"
 	"strconv"
+	"sync"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/aria-lopez/go-luxir/luxirpb"
@@ -16,16 +21,18 @@ import (
 const (
 	streamBatchDocs  = 1000
 	streamBatchBytes = 3 << 20 // ;; leaves room under Luxir's 4 MiB message limit
+	streamLanes      = 4       // ;; Luxir applies one stream's batches in order, parallel streams index in parallel
 	commitRequestID  = "commit"
 )
 
-// IndexStream ;; index any number of documents over one stream, sent in batches under the 4 MiB limit
+// IndexStream ;; index any number of documents over parallel streams, sent in batches under the 4 MiB limit
 //
 // ;; collection "" defaults to "main", pass a slice as slices.Values(docs)
+// ;; documents with the same id always go down the same stream, so the last one wins like with Index
 // ;; commit options commit once, after every batch is in
 // ;; WithAllOrNone holds per batch, Luxir can't roll back across messages
 // ;; a document that can't be converted stops the stream, nothing after it is sent or committed
-// ;; the response is every batch merged, Errors[].Index is the position in docs
+// ;; the response is every batch merged, Errors[].Index is the position in docs and Ids are in docs order
 // ;; returns *IndexError if some or all the documents fail, with the merged response so far
 func (l *Luxir) IndexStream(ctx context.Context, collection string, docs iter.Seq[Document], opts ...UpdateOption) (*luxirpb.UpdateResponse, error) {
 	tmpl := &luxirpb.UpdateRequest{Collection: collection}
@@ -37,173 +44,302 @@ func (l *Luxir) IndexStream(ctx context.Context, collection string, docs iter.Se
 	commit := tmpl.Commit
 	tmpl.Commit = nil
 
+	// ;; a field map can rename another key onto id, so routing by "id" could split one id across streams
+	n := streamLanes
+	if len(tmpl.FieldMap) > 0 || tmpl.DropUnmapped {
+		n = 1
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stream, err := l.indexer.UpdateStream(ctx)
-	if err != nil {
-		return nil, &IndexError{Err: err}
+	m := newStreamMerge()
+	lanes := make([]*streamLane, n)
+	for i := range lanes {
+		st, err := l.indexer.UpdateStream(ctx)
+		if err != nil {
+			return nil, &IndexError{Err: err}
+		}
+		lanes[i] = &streamLane{stream: st, batches: make(chan *luxirpb.UpdateRequest, 2)}
+		go lanes[i].recv(m)
 	}
-
-	acks := make(chan streamAck)
-	go func() {
-		for {
-			resp, err := stream.Recv()
-			select {
-			case acks <- streamAck{resp, err}:
-			case <-ctx.Done():
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	m := &streamMerge{}
-	pending := 0
-	take := func(a streamAck) {
-		m.add(a)
-		if a.err == nil {
-			pending--
-		}
-	}
-	// poll ;; take acks that are ready, so a failed request stops the stream early
-	poll := func() {
-		for {
-			select {
-			case a := <-acks:
-				take(a)
-			default:
-				return
-			}
-		}
-	}
-	wait := func() {
-		for pending > 0 && m.err == nil {
-			select {
-			case a := <-acks:
-				take(a)
-			case <-ctx.Done():
-				m.err = ctx.Err()
-			}
-		}
-	}
-	send := func(r *luxirpb.UpdateRequest) {
-		if err := stream.Send(r); err != nil {
-			// ;; io.EOF means Luxir ended the stream, its status comes from Recv
-			if !errors.Is(err, io.EOF) {
-				m.fail(err)
-			}
-			pending++ // ;; never answered, wait stops on the stream error
-			return
-		}
-		pending++
+	var senders sync.WaitGroup
+	for _, ln := range lanes {
+		senders.Add(1)
+		go func() {
+			defer senders.Done()
+			ln.send(m)
+		}()
 	}
 
 	var (
-		batch   *luxirpb.UpdateRequest
-		size    int
 		pos     int
+		rr      int
+		first   = true
 		convErr *IndexError
 	)
-	flush := func() {
-		if batch != nil {
-			send(batch)
-			batch = nil
+	enqueue := func(ln *streamLane) {
+		if ln.batch == nil {
+			return
 		}
+		m.enqueue(ln.batch, ln.positions)
+		select {
+		case ln.batches <- ln.batch:
+		case <-ctx.Done():
+		}
+		ln.batch, ln.positions, ln.size = nil, nil, 0
 	}
 	if docs != nil {
 		for d := range docs {
+			if m.stopped() {
+				break
+			}
 			pm, err := d.toMap()
 			if err != nil {
 				convErr = &IndexError{Msg: fmt.Sprintf("err on document: %d: %v", pos, err), Err: err}
 				break
 			}
-			n := proto.Size(pm)
-			if batch != nil && (len(batch.Docs) >= streamBatchDocs || size+n > streamBatchBytes) {
-				flush()
+			// ;; parallel writes into a collection a write just auto-created can hang in Luxir,
+			// ;; one made with CreateCollection can't, so make it before routing anything (already there is fine)
+			if first {
+				first = false
+				if n > 1 && !l.ensureCollection(ctx, collection) {
+					n = 1
+				}
 			}
-			if batch == nil {
-				batch = proto.CloneOf(tmpl)
-				batch.RequestId = strconv.Itoa(len(m.starts))
-				m.starts = append(m.starts, pos)
-				size = 0
+			ln := lanes[laneOf(d, n, &rr)]
+			size := mapBound(pm)
+			if ln.batch != nil && (len(ln.batch.Docs) >= streamBatchDocs || ln.size+size > streamBatchBytes) {
+				enqueue(ln)
 			}
-			batch.Docs = append(batch.Docs, pm)
-			size += n
+			if ln.batch == nil {
+				ln.batch = proto.CloneOf(tmpl)
+			}
+			ln.batch.Docs = append(ln.batch.Docs, pm)
+			ln.positions = append(ln.positions, pos)
+			ln.size += size
 			pos++
-
-			poll()
-			if m.stopped() {
-				batch = nil
-				break
-			}
 		}
 	}
-	if convErr == nil && !m.stopped() {
-		flush()
+	for _, ln := range lanes {
+		if convErr == nil && !m.stopped() {
+			enqueue(ln)
+		}
+		close(ln.batches)
 	}
-	wait()
+	senders.Wait()
+	m.wait()
 
 	if commit != nil && convErr == nil && !m.stopped() {
-		send(&luxirpb.UpdateRequest{RequestId: commitRequestID, Collection: collection, Commit: commit})
-		wait()
+		m.enqueue(nil, nil)
+		lanes[0].sendOne(m, &luxirpb.UpdateRequest{RequestId: commitRequestID, Collection: collection, Commit: commit})
+		m.wait()
 	}
-	if m.err == nil {
-		stream.CloseSend()
+	if m.failed() == nil {
+		for _, ln := range lanes {
+			ln.stream.CloseSend()
+		}
 	}
 
 	resp := m.result()
-	switch {
+	switch err := m.failed(); {
 	case convErr != nil:
 		convErr.Resp = resp
 		return resp, convErr
-	case m.err != nil:
-		return resp, &IndexError{Resp: resp, Msg: fmt.Sprintf("stream: %v", m.err), Err: m.err}
+	case err != nil:
+		return resp, &IndexError{Resp: resp, Msg: fmt.Sprintf("stream: %v", err), Err: err}
 	case resp.GetStatus() != luxirpb.UpdateResponse_OK:
 		return resp, &IndexError{Resp: resp}
 	}
 	return resp, nil
 }
 
-// streamAck ;; one Recv from the update stream
+// ensureCollection ;; make the collection if it isn't there, false if that couldn't be checked
+func (l *Luxir) ensureCollection(ctx context.Context, name string) bool {
+	if name == "" {
+		name = "main"
+	}
+	_, err := l.admin.CreateCollection(ctx, &luxirpb.CreateCollectionRequest{Name: name})
+	return err == nil || status.Code(err) == codes.AlreadyExists
+}
+
+// laneOf ;; which stream a document goes down, by its id so every version of an id stays in order
+func laneOf(d Document, n int, rr *int) int {
+	if n == 1 {
+		return 0
+	}
+	var key string
+	switch id := d["id"].(type) {
+	case nil:
+		*rr++ // ;; no id, nothing can replace it, so any stream will do
+		return *rr % n
+	case string:
+		key = id
+	case []byte:
+		key = string(id)
+	case int:
+		key = strconv.FormatInt(int64(id), 10)
+	case int8:
+		key = strconv.FormatInt(int64(id), 10)
+	case int16:
+		key = strconv.FormatInt(int64(id), 10)
+	case int32:
+		key = strconv.FormatInt(int64(id), 10)
+	case int64:
+		key = strconv.FormatInt(id, 10)
+	case uint8:
+		key = strconv.FormatUint(uint64(id), 10)
+	case uint16:
+		key = strconv.FormatUint(uint64(id), 10)
+	case uint32:
+		key = strconv.FormatUint(uint64(id), 10)
+	default:
+		key = fmt.Sprint(id)
+	}
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32() % uint32(n))
+}
+
+// streamLane ;; one update stream, its next batch, and the goroutines feeding and reading it
+type streamLane struct {
+	stream    luxirpb.Indexer_UpdateStreamClient
+	batches   chan *luxirpb.UpdateRequest
+	batch     *luxirpb.UpdateRequest
+	positions []int
+	size      int
+}
+
+func (ln *streamLane) send(m *streamMerge) {
+	for r := range ln.batches {
+		ln.sendOne(m, r)
+	}
+}
+
+func (ln *streamLane) sendOne(m *streamMerge, r *luxirpb.UpdateRequest) {
+	if m.stopped() {
+		m.skip()
+		return
+	}
+	// ;; io.EOF means Luxir ended the stream, its status comes from Recv
+	if err := ln.stream.Send(r); err != nil && !errors.Is(err, io.EOF) {
+		m.fail(err)
+	}
+}
+
+func (ln *streamLane) recv(m *streamMerge) {
+	for {
+		resp, err := ln.stream.Recv()
+		m.add(streamAck{resp, err})
+		if err != nil {
+			return
+		}
+	}
+}
+
+// streamAck ;; one Recv from an update stream
 type streamAck struct {
 	resp *luxirpb.UpdateResponse
 	err  error
 }
 
-// streamMerge ;; the batch responses of one IndexStream folded into one
+// streamMerge ;; the batch responses of one IndexStream folded into one, shared by every lane
 type streamMerge struct {
-	starts []int // ;; position in docs of each batch's first document
-	ids    map[int][]string
-	errs   []*luxirpb.UpdateResponse_DocError
-	total  int64
-	ver    uint64
-	reqErr *luxirpb.Error
+	mu      sync.Mutex
+	done    *sync.Cond
+	next    int           // ;; request id of the next batch
+	pending int           // ;; batches sent or queued and not answered yet
+	batches map[int][]int // ;; position in docs of each document of each unanswered batch
+	ids     []posID
+	errs    []*luxirpb.UpdateResponse_DocError
+	total   int64
+	ver     uint64
+	reqErr  *luxirpb.Error
 
-	ok, partial, failed int
-	commitFailed        bool
-	err                 error // ;; the stream itself failed
+	ok, partial, failedN int
+	commitFailed         bool
+	err                  error // ;; a stream itself failed
+}
+
+type posID struct {
+	pos int
+	id  string
+}
+
+func newStreamMerge() *streamMerge {
+	m := &streamMerge{batches: map[int][]int{}}
+	m.done = sync.NewCond(&m.mu)
+	return m
+}
+
+// enqueue ;; number the batch and count it as pending, a nil batch is the commit
+func (m *streamMerge) enqueue(r *luxirpb.UpdateRequest, positions []int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pending++
+	if r != nil {
+		r.RequestId = strconv.Itoa(m.next)
+		m.batches[m.next] = positions
+		m.next++
+	}
+}
+
+// skip ;; a queued batch that won't be sent after all
+func (m *streamMerge) skip() {
+	m.mu.Lock()
+	m.pending--
+	m.mu.Unlock()
+	m.done.Broadcast()
 }
 
 func (m *streamMerge) fail(err error) {
+	m.mu.Lock()
 	if m.err == nil {
 		m.err = err
 	}
+	m.mu.Unlock()
+	m.done.Broadcast()
+}
+
+func (m *streamMerge) failed() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.err
 }
 
 // stopped ;; nothing more should be sent
-func (m *streamMerge) stopped() bool { return m.err != nil || m.reqErr != nil }
+func (m *streamMerge) stopped() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.err != nil || m.reqErr != nil
+}
+
+// wait ;; until every pending batch is answered or a stream fails
+func (m *streamMerge) wait() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for m.pending > 0 && m.err == nil {
+		m.done.Wait()
+	}
+}
 
 func (m *streamMerge) add(a streamAck) {
+	defer m.done.Broadcast()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if a.err != nil {
 		if errors.Is(a.err, io.EOF) {
+			if m.pending == 0 {
+				return // ;; the stream closed after answering everything
+			}
 			a.err = io.ErrUnexpectedEOF // ;; Luxir answers every request, an early end is a failure
 		}
-		m.fail(a.err)
+		if m.err == nil {
+			m.err = a.err
+		}
 		return
 	}
 	r := a.resp
+	m.pending--
 	m.ver = max(m.ver, r.GetUpdateVersion())
 	if r.GetError() != nil && m.reqErr == nil {
 		m.reqErr = r.GetError()
@@ -219,37 +355,53 @@ func (m *streamMerge) add(a streamAck) {
 	case luxirpb.UpdateResponse_PARTIAL:
 		m.partial++
 	default:
-		m.failed++
+		m.failedN++
 	}
 
-	start := 0
 	b, err := strconv.Atoi(r.GetRequestId())
-	if err == nil && b >= 0 && b < len(m.starts) {
-		start = m.starts[b]
-		if len(r.GetIds()) > 0 {
-			if m.ids == nil {
-				m.ids = map[int][]string{}
-			}
-			m.ids[b] = r.GetIds()
-		}
+	positions, known := m.batches[b]
+	if err != nil || !known {
+		positions = nil
 	}
+	delete(m.batches, b)
+	at := func(i int32) int32 {
+		if i >= 0 && int(i) < len(positions) {
+			return int32(positions[i])
+		}
+		return i
+	}
+	bad := map[int32]bool{}
 	for _, e := range r.GetErrors() {
+		bad[e.GetIndex()] = true
 		e = proto.CloneOf(e)
-		e.Index += int32(start)
+		e.Index = at(e.Index)
 		m.errs = append(m.errs, e)
 	}
 	m.total += r.GetTotalErrors()
+	// ;; ids line up with the batch's documents once the failed ones are skipped
+	i := int32(0)
+	for _, id := range r.GetIds() {
+		for bad[i] {
+			i++
+		}
+		m.ids = append(m.ids, posID{int(at(i)), id})
+		i++
+	}
 }
 
 func (m *streamMerge) result() *luxirpb.UpdateResponse {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	slices.SortStableFunc(m.ids, func(a, b posID) int { return a.pos - b.pos })
+	slices.SortStableFunc(m.errs, func(a, b *luxirpb.UpdateResponse_DocError) int { return int(a.GetIndex() - b.GetIndex()) })
 	out := &luxirpb.UpdateResponse{UpdateVersion: m.ver, Errors: m.errs, TotalErrors: m.total, Error: m.reqErr}
-	for b := range m.starts {
-		out.Ids = append(out.Ids, m.ids[b]...)
+	for _, p := range m.ids {
+		out.Ids = append(out.Ids, p.id)
 	}
 	switch {
 	case m.reqErr != nil || m.err != nil || m.commitFailed:
 		out.Status = luxirpb.UpdateResponse_ERROR
-	case m.partial == 0 && m.failed == 0:
+	case m.partial == 0 && m.failedN == 0:
 		out.Status = luxirpb.UpdateResponse_OK
 	case m.ok == 0 && m.partial == 0:
 		out.Status = luxirpb.UpdateResponse_ERROR
@@ -257,4 +409,61 @@ func (m *streamMerge) result() *luxirpb.UpdateResponse {
 		out.Status = luxirpb.UpdateResponse_PARTIAL
 	}
 	return out
+}
+
+// mapBound ;; an upper bound on a document's encoded size, much cheaper than proto.Size
+//
+// ;; every varint and length prefix is counted at its widest, so a batch never goes over the limit
+func mapBound(m *luxirpb.Map) int {
+	n := 0
+	for k, v := range m.GetFields() {
+		n += len(k) + valBound(v) + 16
+	}
+	return n
+}
+
+func valBound(v *luxirpb.Val) int {
+	const head = 16
+	switch x := v.GetKind().(type) {
+	case *luxirpb.Val_S:
+		return len(x.S) + head
+	case *luxirpb.Val_Bin:
+		return len(x.Bin) + head
+	case *luxirpb.Val_ArrS:
+		n := head
+		for _, s := range x.ArrS.GetV() {
+			n += len(s) + 6
+		}
+		return n
+	case *luxirpb.Val_ArrBin:
+		n := head
+		for _, b := range x.ArrBin.GetV() {
+			n += len(b) + 6
+		}
+		return n
+	case *luxirpb.Val_ArrI:
+		return 11*len(x.ArrI.GetV()) + head
+	case *luxirpb.Val_ArrF:
+		return 5*len(x.ArrF.GetV()) + head
+	case *luxirpb.Val_ArrD:
+		return 9*len(x.ArrD.GetV()) + head
+	case *luxirpb.Val_Vec:
+		return 5*len(x.Vec.GetF32().GetV()) + 2*head
+	case *luxirpb.Val_ArrVec:
+		n := head
+		for _, vec := range x.ArrVec.GetV() {
+			n += 5*len(vec.GetF32().GetV()) + 2*head
+		}
+		return n
+	case *luxirpb.Val_Arr:
+		n := head
+		for _, e := range x.Arr.GetV() {
+			n += valBound(e) + 6
+		}
+		return n
+	case *luxirpb.Val_Map:
+		return mapBound(x.Map) + head
+	default:
+		return head + 11
+	}
 }

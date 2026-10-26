@@ -1,6 +1,7 @@
 package luxir
 
 import (
+	"context"
 	"net"
 	"sync"
 	"testing"
@@ -104,9 +105,26 @@ func fakeServer(t *testing.T, register func(*grpc.Server), opts ...ClientOption)
 	return l
 }
 
+type fakeAdmin struct {
+	luxirpb.UnimplementedAdminServer
+	create error
+}
+
+func (f *fakeAdmin) CreateCollection(_ context.Context, r *luxirpb.CreateCollectionRequest) (*luxirpb.CreateCollectionResponse, error) {
+	return &luxirpb.CreateCollectionResponse{Name: r.GetName()}, f.create
+}
+
 func fakeIndexerLuxir(t *testing.T, stream func(updateStream) error) *Luxir {
 	t.Helper()
-	return fakeServer(t, func(s *grpc.Server) { luxirpb.RegisterIndexerServer(s, &fakeIndexer{stream: stream}) })
+	return fakeIndexerAdminLuxir(t, stream, nil)
+}
+
+func fakeIndexerAdminLuxir(t *testing.T, stream func(updateStream) error, create error) *Luxir {
+	t.Helper()
+	return fakeServer(t, func(s *grpc.Server) {
+		luxirpb.RegisterIndexerServer(s, &fakeIndexer{stream: stream})
+		luxirpb.RegisterAdminServer(s, &fakeAdmin{create: create})
+	})
 }
 
 func fakeReply(resps ...*luxirpb.SearchResponse) func(*luxirpb.SearchRequest) ([]*luxirpb.SearchResponse, error) {
