@@ -83,6 +83,8 @@ func main() {
   if err != nil {
     // handle *UpdateError
   }
+  // commit after writes
+  l.Commit()
 
   // get some documents and do something with them
   res, err := l.Search(ctx, "books", luxir.Match("title_t", "dune"), luxir.WithSort("year_i", false))
@@ -98,11 +100,9 @@ func main() {
 }
 ```
 
-Every call takes a `context.Context` for deadlines and cancellation. A collection name of `""` means Luxir's default collection, `"main"`.
-
 ## documents and values
 
-A `luxir.Document` is a `map[string]any`. These values are accepted:
+A `luxir.Document` is a `map[string]any`. and these are the types u can use:
 
 | Go value                                             | Luxir                              |
 | ---------------------------------------------------- | ---------------------------------- |
@@ -116,7 +116,7 @@ A `luxir.Document` is a `map[string]any`. These values are accepted:
 | `[][]float32`                                        | a multi-valued vector field        |
 | `nil`                                                | null                               |
 
-`uint`, `uint64`, nested maps and structs are rejected before anything is sent: a `uint64` can overflow Luxir's int64, and Luxir has no nested objects.
+`uint`, `uint64`, nested maps and structs are rejected, Luxir doesn't support them!
 
 When reading results, ints come back as `int64`, dates as `int64` epoch millis, string lists as `[]string`, and vectors as `[]float32`. Vectors are only returned when you ask for them with `WithFields`.
 
@@ -126,10 +126,10 @@ When reading results, ints come back as `int64`, dates as `int64` epoch millis, 
 // add or replace documents: the same id replaces the whole old document
 resp, err := l.Index(ctx, "books", docs, luxir.WithCommit())
 
-// any number of documents, streamed in batches (one Index call is one 4 MiB gRPC message)
+// any number of documents, streamed in batches (one Index call is one gRPC message)
 resp, err = l.IndexStream(ctx, "books", slices.Values(manyDocs), luxir.WithCommit())
 
-// remove by id, an id that isn't there is skipped
+// remove by id, an id that isn't there is just skipped
 resp, err = l.Delete(ctx, "books", []string{"b1", "b2"}, luxir.WithCommit())
 
 // make everything written so far searchable
