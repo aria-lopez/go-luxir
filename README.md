@@ -389,7 +389,27 @@ resp, err := l.CacheControl(ctx, &luxirpb.CacheControlRequest{Collection: "books
 
 ## performance
 
-Measured against a local Luxir 0.1.0 node (RAM storage), with the client and the server on the same AMD Ryzen 5 1600X (6 cores / 12 threads). There were 100k documents of 6 fields each, and 16 workers for throughput. "Raw gRPC" is hand-written code on the generated stubs, and "HTTP" is Luxir's JSON API through Go's `net/http`. Your numbers will differ. The point is the comparison.
+### real-world workload
+
+This is Apache Solr's enterprise benchmark, [solr-bench](https://github.com/thesearchstack/solr-bench) `stress-facets-local-100m`, translated to go-luxir v0.1.3. It uses the first 100M events of the real `ecommerce-events-150m` dataset (product views, carts and purchases), with 16 concurrent writers and 16 concurrent query clients, running the suite's own query files. Luxir 0.1.0 used filesystem storage with an 8 GB RAM budget, on the same machine as the client: an AMD Ryzen 5 1600X (6 cores / 12 threads) with 22 GB RAM.
+
+| workload | result |
+|---|---|
+| bulk ingest, 100M events, 16 `IndexStream` writers | **7m04s, ~236k docs/s** (the final commit took another 2.5 min) |
+| node restart, 3 times | healthy again in ~1s each time; the same client kept working and all 100M documents were intact |
+| `event_type` terms facet over a 7-day window (~13M events) | 33.5 q/s, p50 457 ms, p99 1.05 s |
+| 300-bucket price range facet over a week of purchases | 55 q/s, p50 278 ms, p99 601 ms |
+| top-10 `product_id` facet plus `avg(price)` over a week of purchases | 51 q/s, p50 293 ms, p99 626 ms |
+| session join: facet the sessions in a day, then `AnyOf` in 40k-value chunks | 0.7 q/s, p50 23 s (~9 s with no other load; Luxir 0.1.0 has no join query) |
+| export a day's purchases with `Scan` | 24,510 docs in 99 ms |
+
+The test checked every one of the 18,163 query responses against answers computed from the source data, and none were wrong. Before the queries, 2,454 records were read back field by field. Solr's `TestStressVersions` consistency test was translated too: 10 randomized seeds of concurrent writers, deleters, committers and readers, with 500k reads, 136k writes, 38k deletes and 27k commits, run under the race detector while facet queries hit the 100M collection. It found no stale reads, no lost writes and no data races. The join is slow on the server: one join running alone used 0.3 s of client CPU out of 9.3 s.
+
+The data also has the usual real-world problems. Event ids reach 1.6e18, which is beyond what a `float64` holds exactly. Decode into `int64` fields, not `map[string]any`, or distinct events will share an id. About 17k lines also have the brand "infinity" written as a bare JSON `Infinity`, which needs repairing before Go's `encoding/json` will read it.
+
+### client overhead
+
+Measured against a local Luxir 0.1.0 node (RAM storage) on the same machine as above, with 100k small synthetic documents of 6 fields each and 16 workers for throughput. "Raw gRPC" is hand-written code on the generated stubs, and "HTTP" is Luxir's JSON API through Go's `net/http`. Your numbers will differ. The point is the comparison.
 
 | | go-luxir | raw gRPC | HTTP |
 |---|---|---|---|
