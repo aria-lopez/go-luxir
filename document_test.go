@@ -3,6 +3,7 @@ package luxir
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -39,6 +40,11 @@ func TestToVal(t *testing.T) {
 		{"uint16", uint16(65535), &luxirpb.Val{Kind: &luxirpb.Val_I{I: 65535}}},
 		{"uint32 max", uint32(4294967295), &luxirpb.Val{Kind: &luxirpb.Val_I{I: 4294967295}}},
 
+		// ;; times are epoch millis, whatever the zone
+		{"time epoch", time.UnixMilli(0), &luxirpb.Val{Kind: &luxirpb.Val_I{I: 0}}},
+		{"time before 1970", time.Date(1965, 8, 1, 0, 0, 0, 0, time.UTC), &luxirpb.Val{Kind: &luxirpb.Val_I{I: -139449600000}}},
+		{"time other zone", time.Date(1965, 8, 1, 2, 0, 0, 0, time.FixedZone("x", 2*3600)), &luxirpb.Val{Kind: &luxirpb.Val_I{I: -139449600000}}},
+
 		// ;; floats keep their width
 		{"float32", float32(1.5), &luxirpb.Val{Kind: &luxirpb.Val_F{F: 1.5}}},
 		{"float64", float64(2.5), &luxirpb.Val{Kind: &luxirpb.Val_D{D: 2.5}}},
@@ -51,6 +57,20 @@ func TestToVal(t *testing.T) {
 		{"[]float32", []float32{1.5, 2.5}, &luxirpb.Val{Kind: &luxirpb.Val_ArrF{ArrF: &luxirpb.ArrFloat{V: []float32{1.5, 2.5}}}}},
 		{"[]float64", []float64{1.5, 2.5}, &luxirpb.Val{Kind: &luxirpb.Val_ArrD{ArrD: &luxirpb.ArrDouble{V: []float64{1.5, 2.5}}}}},
 		{"[][]byte", [][]byte{[]byte("a"), []byte("b")}, &luxirpb.Val{Kind: &luxirpb.Val_ArrBin{ArrBin: &luxirpb.ArrBin{V: [][]byte{[]byte("a"), []byte("b")}}}}},
+
+		{"point is lon lat", Point{Lat: 40.7, Lon: -74}, &luxirpb.Val{Kind: &luxirpb.Val_ArrD{ArrD: &luxirpb.ArrDouble{V: []float64{-74, 40.7}}}}},
+		{"[]Point", []Point{{Lat: 1, Lon: 2}, {Lat: 3, Lon: 4}}, &luxirpb.Val{Kind: &luxirpb.Val_Arr{Arr: &luxirpb.ArrVal{V: []*luxirpb.Val{
+			{Kind: &luxirpb.Val_ArrD{ArrD: &luxirpb.ArrDouble{V: []float64{2, 1}}}},
+			{Kind: &luxirpb.Val_ArrD{ArrD: &luxirpb.ArrDouble{V: []float64{4, 3}}}},
+		}}}}},
+		{"[][]float64", [][]float64{{-74, 40.7}, {-0.1, 51.5}}, &luxirpb.Val{Kind: &luxirpb.Val_Arr{Arr: &luxirpb.ArrVal{V: []*luxirpb.Val{
+			{Kind: &luxirpb.Val_ArrD{ArrD: &luxirpb.ArrDouble{V: []float64{-74, 40.7}}}},
+			{Kind: &luxirpb.Val_ArrD{ArrD: &luxirpb.ArrDouble{V: []float64{-0.1, 51.5}}}},
+		}}}}},
+		{"[][]float32 multi vector", [][]float32{{1, 2}, {3, 4}}, &luxirpb.Val{Kind: &luxirpb.Val_ArrVec{ArrVec: &luxirpb.ArrVector{V: []*luxirpb.Vector{
+			{Kind: &luxirpb.Vector_F32{F32: &luxirpb.ArrFloat{V: []float32{1, 2}}}},
+			{Kind: &luxirpb.Vector_F32{F32: &luxirpb.ArrFloat{V: []float32{3, 4}}}},
+		}}}}},
 
 		// ;; []any converts element by element, and may mix kinds
 		{"[]any mixed", []any{"a", 1, 2.5}, &luxirpb.Val{Kind: &luxirpb.Val_Arr{Arr: &luxirpb.ArrVal{V: []*luxirpb.Val{

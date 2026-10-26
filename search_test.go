@@ -45,12 +45,12 @@ func TestFromVal_RoundTrip(t *testing.T) {
 	in := Document{
 		"s": "x", "b": true, "i": 7, "i64": int64(8), "f": float32(1.5), "d": 2.5,
 		"bin": []byte("hi"), "ss": []string{"a", "b"}, "is": []int{1, 2}, "ds": []float64{1, 2},
-		"mixed": []any{"a", 3},
+		"mixed": []any{"a", 3}, "mv": [][]float32{{1, 2}, {3}}, "pt": Point{Lat: 1, Lon: 2},
 	}
 	want := Document{
 		"s": "x", "b": true, "i": int64(7), "i64": int64(8), "f": float32(1.5), "d": 2.5,
 		"bin": []byte("hi"), "ss": []string{"a", "b"}, "is": []int64{1, 2}, "ds": []float64{1, 2},
-		"mixed": []any{"a", int64(3)},
+		"mixed": []any{"a", int64(3)}, "mv": [][]float32{{1, 2}, {3}}, "pt": []float64{2, 1},
 	}
 
 	m, err := in.toMap()

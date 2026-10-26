@@ -2,6 +2,7 @@ package luxir
 
 import (
 	"fmt"
+	"time"
 
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -10,6 +11,7 @@ import (
 
 // Document ;; one record to index, [field name]->[value]
 // ;; the field names suffix tells Luxir the type (like title_t, year_i, etc)
+// ;; values: string, bool, ints, floats, time.Time, Point, their slices, []float32 vectors, [][]float32 multi-vectors
 type Document map[string]any
 
 // toMap ;; change a document to a protobuf *Map
@@ -46,6 +48,8 @@ func toVal(v any) (*luxirpb.Val, error) {
 		return &luxirpb.Val{Kind: &luxirpb.Val_I{I: int64(x)}}, nil
 	case int64:
 		return &luxirpb.Val{Kind: &luxirpb.Val_I{I: x}}, nil
+	case time.Time:
+		return &luxirpb.Val{Kind: &luxirpb.Val_I{I: x.UnixMilli()}}, nil
 	case uint8:
 		return &luxirpb.Val{Kind: &luxirpb.Val_I{I: int64(x)}}, nil
 	case uint16:
@@ -72,6 +76,26 @@ func toVal(v any) (*luxirpb.Val, error) {
 		return &luxirpb.Val{Kind: &luxirpb.Val_ArrD{ArrD: &luxirpb.ArrDouble{V: x}}}, nil
 	case [][]byte:
 		return &luxirpb.Val{Kind: &luxirpb.Val_ArrBin{ArrBin: &luxirpb.ArrBin{V: x}}}, nil
+	case Point:
+		return arrD(x.Lon, x.Lat), nil
+	case []Point:
+		vals := make([]*luxirpb.Val, len(x))
+		for i, p := range x {
+			vals[i] = arrD(p.Lon, p.Lat)
+		}
+		return &luxirpb.Val{Kind: &luxirpb.Val_Arr{Arr: &luxirpb.ArrVal{V: vals}}}, nil
+	case [][]float64:
+		vals := make([]*luxirpb.Val, len(x))
+		for i, v := range x {
+			vals[i] = arrD(v...)
+		}
+		return &luxirpb.Val{Kind: &luxirpb.Val_Arr{Arr: &luxirpb.ArrVal{V: vals}}}, nil
+	case [][]float32:
+		vecs := make([]*luxirpb.Vector, len(x))
+		for i, v := range x {
+			vecs[i] = &luxirpb.Vector{Kind: &luxirpb.Vector_F32{F32: &luxirpb.ArrFloat{V: v}}}
+		}
+		return &luxirpb.Val{Kind: &luxirpb.Val_ArrVec{ArrVec: &luxirpb.ArrVector{V: vecs}}}, nil
 	case []any:
 		vals := make([]*luxirpb.Val, len(x))
 		for i, e := range x {
@@ -85,6 +109,11 @@ func toVal(v any) (*luxirpb.Val, error) {
 	default:
 		return nil, fmt.Errorf("unsupported type %T", v)
 	}
+}
+
+// arrD ;; a double array Val, geo points go [lon, lat]
+func arrD(v ...float64) *luxirpb.Val {
+	return &luxirpb.Val{Kind: &luxirpb.Val_ArrD{ArrD: &luxirpb.ArrDouble{V: v}}}
 }
 
 // fromVal ;; Change a protobuf *Val to a native value, the inverse of toVal
@@ -118,6 +147,12 @@ func fromVal(v *luxirpb.Val) (any, error) {
 		return x.ArrBin.GetV(), nil
 	case *luxirpb.Val_Vec:
 		return x.Vec.GetF32().GetV(), nil
+	case *luxirpb.Val_ArrVec:
+		out := make([][]float32, len(x.ArrVec.GetV()))
+		for i, v := range x.ArrVec.GetV() {
+			out[i] = v.GetF32().GetV()
+		}
+		return out, nil
 	case *luxirpb.Val_Arr:
 		out := make([]any, len(x.Arr.GetV()))
 		for i, e := range x.Arr.GetV() {

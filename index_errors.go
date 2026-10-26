@@ -18,6 +18,8 @@ func (e *IndexError) Error() string {
 	switch {
 	case e.Msg != "":
 		return "[go-luxir] index: " + e.Msg
+	case e.Resp.GetError() != nil:
+		return fmt.Sprintf("[go-luxir] index %s: %s", e.Resp.GetStatus(), e.Resp.GetError().GetMessage())
 	case e.Resp != nil:
 		return fmt.Sprintf("[go-luxir] index %s: %d document(s) failed", e.Resp.GetStatus(), e.Resp.GetTotalErrors())
 	case e.Err != nil:
