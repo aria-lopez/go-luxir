@@ -112,6 +112,8 @@ func main() {
 }
 ```
 
+Every call takes a `context.Context`. Give your calls a deadline (`context.WithTimeout`): it turns a stalled or unreachable node into an error, instead of a call that waits forever.
+
 ## documents and values
 
 A `luxir.Document` is a `map[string]any`. and these are the types u can use:
