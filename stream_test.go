@@ -98,6 +98,22 @@ func TestIndexStream_PartialPositionsAcrossBatches(t *testing.T) {
 	}
 }
 
+func TestIndexStream_AllFailWithCommit(t *testing.T) {
+	l := getClient(t)
+	coll := newCollection(t, l)
+	docs := make([]Document, 1500)
+	for i := range docs {
+		docs[i] = Document{"id": fmt.Sprintf("bad%d", i), "nosuffix": i}
+	}
+
+	resp, err := l.IndexStream(timeout(t), coll, slices.Values(docs), WithCommit())
+
+	var ie *IndexError
+	if !errors.As(err, &ie) || resp.GetStatus() != luxirpb.UpdateResponse_ERROR || resp.GetTotalErrors() != 1500 {
+		t.Errorf("status = %s total errors %d err %v, want ERROR for 1500 failures", resp.GetStatus(), resp.GetTotalErrors(), err)
+	}
+}
+
 func TestIndexStream_AllOrNoneIsPerBatch(t *testing.T) {
 	l := getClient(t)
 	coll := newCollection(t, l)
@@ -364,6 +380,9 @@ func TestStreamMerge_Status(t *testing.T) {
 		return streamAck{resp: &luxirpb.UpdateResponse{Status: s}}
 	}
 	ok, partial, bad := ack(luxirpb.UpdateResponse_OK), ack(luxirpb.UpdateResponse_PARTIAL), ack(luxirpb.UpdateResponse_ERROR)
+	commit := func(s luxirpb.UpdateResponse_Status) streamAck {
+		return streamAck{resp: &luxirpb.UpdateResponse{RequestId: commitRequestID, Status: s}}
+	}
 
 	tests := []struct {
 		name string
@@ -377,6 +396,11 @@ func TestStreamMerge_Status(t *testing.T) {
 		{"all error", []streamAck{bad, bad}, luxirpb.UpdateResponse_ERROR},
 		{"stream failed", []streamAck{ok, {err: errors.New("x")}}, luxirpb.UpdateResponse_ERROR},
 		{"request failed", []streamAck{ok, {resp: &luxirpb.UpdateResponse{Status: luxirpb.UpdateResponse_ERROR, Error: &luxirpb.Error{}}}}, luxirpb.UpdateResponse_ERROR},
+		{"all failed then commit ok", []streamAck{bad, bad, commit(luxirpb.UpdateResponse_OK)}, luxirpb.UpdateResponse_ERROR},
+		{"all ok then commit ok", []streamAck{ok, commit(luxirpb.UpdateResponse_OK)}, luxirpb.UpdateResponse_OK},
+		{"one failed then commit ok", []streamAck{ok, bad, commit(luxirpb.UpdateResponse_OK)}, luxirpb.UpdateResponse_PARTIAL},
+		{"commit failed", []streamAck{ok, commit(luxirpb.UpdateResponse_ERROR)}, luxirpb.UpdateResponse_ERROR},
+		{"only a commit", []streamAck{commit(luxirpb.UpdateResponse_OK)}, luxirpb.UpdateResponse_OK},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

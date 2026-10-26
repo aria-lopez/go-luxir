@@ -182,6 +182,7 @@ type streamMerge struct {
 	reqErr *luxirpb.Error
 
 	ok, partial, failed int
+	commitFailed        bool
 	err                 error // ;; the stream itself failed
 }
 
@@ -207,6 +208,11 @@ func (m *streamMerge) add(a streamAck) {
 	if r.GetError() != nil && m.reqErr == nil {
 		m.reqErr = r.GetError()
 	}
+	// ;; the commit has no documents, it only counts if it failed
+	if r.GetRequestId() == commitRequestID {
+		m.commitFailed = r.GetStatus() != luxirpb.UpdateResponse_OK
+		return
+	}
 	switch r.GetStatus() {
 	case luxirpb.UpdateResponse_OK:
 		m.ok++
@@ -214,9 +220,6 @@ func (m *streamMerge) add(a streamAck) {
 		m.partial++
 	default:
 		m.failed++
-	}
-	if r.GetRequestId() == commitRequestID {
-		return
 	}
 
 	start := 0
@@ -244,7 +247,7 @@ func (m *streamMerge) result() *luxirpb.UpdateResponse {
 		out.Ids = append(out.Ids, m.ids[b]...)
 	}
 	switch {
-	case m.reqErr != nil || m.err != nil:
+	case m.reqErr != nil || m.err != nil || m.commitFailed:
 		out.Status = luxirpb.UpdateResponse_ERROR
 	case m.partial == 0 && m.failed == 0:
 		out.Status = luxirpb.UpdateResponse_OK

@@ -122,7 +122,7 @@ func Min(expr string) Op { return Metric("min("+expr+")", nil) }
 // Max ;; largest value of a value expression
 func Max(expr string) Op { return Metric("max("+expr+")", nil) }
 
-// Count ;; total values a field has across the domain
+// Count ;; total values a numeric field has across the domain, for a document count use Found
 func Count(expr string) Op { return Metric("sum(count("+expr+"))", nil) }
 
 // Docs ;; ranked documents as an op, ex the best few in every facet bucket

@@ -18,85 +18,97 @@ You need Go 1.26+
 package main
 
 import (
-    "context"
-    "fmt"
-    "log"
+	"context"
+	"errors"
+	"fmt"
+	"log"
 
-    "github.com/aria-lopez/go-luxir"
+	"github.com/aria-lopez/go-luxir"
+	"github.com/aria-lopez/go-luxir/luxirpb"
 )
 
 func main() {
-  ctx := contex.Background()
-  // create new instance of luxir, if u pass "" the default it localhost:9401
-  /* You can also pass this as opts for auth (luxir.NewLuxir(addr, ...opts))
-    luxir.WithTLS(&tls.Config{})
-    luxir.WithMaxMessageSize(32<<20)
-    luxir.WithDialOptions(grpc.WithPerRPCCredentials(myToken))) // anything gRPC offers
-  */
-  l, err := luxir.NewLuxir("localhost:9401")
-  if err != nil {
-    // returns *ConnectError here but it doesnt mean a dial failed its usually bad config with grpc.NewClient()
-  }
-  defer l.Close()
+	ctx := context.Background()
+	// create new instance of luxir, if u pass "" the default it localhost:9401
+	/* You can also pass this as opts for auth (luxir.NewLuxir(addr, ...opts))
+	luxir.WithTLS(&tls.Config{})
+	luxir.WithMaxMessageSize(32<<20)
+	luxir.WithDialOptions(grpc.WithPerRPCCredentials(myToken))) // anything gRPC offers
+	*/
+	l, err := luxir.NewLuxir("localhost:9401")
+	if err != nil {
+		// returns *ConnectError here but it doesnt mean a dial failed its usually bad config with grpc.NewClient()
+		log.Fatal(err)
+	}
+	defer l.Close()
 
-  // once connected you can verify by grabbing your available collections
-  colls, err := l.GetCollections(ctx)
-  if err != nil {
-      // handle *CollectionError
-  }
-  var colName string
-  for _, c := range colls {
-    // here you get a []*luxirpb.CollectionStats
-    collName = c.GetName() // can get name or whtv u need
-  }
+	// once connected you can verify by grabbing your available collections
+	colls, err := l.GetCollections(ctx)
+	if err != nil {
+		// handle *CollectionError
+		log.Fatal(err)
+	}
+	for _, c := range colls {
+		// here you get a []*luxirpb.CollectionStats
+		fmt.Println(c.GetName()) // can get name or whtv u need
+	}
 
-  // set a new schema
-  schema := luxir.NewSchema().
-      Text("title").
-      String("author").
-      Int("year", luxir.Range()). // Range() enables numeric range queries
-      Date("published", luxir.Range()).
-      Geo("location", luxir.Range()).
-      Vector("embedding", 384, luxirpb.VectorMetric_COSINE).
-      Template("_tag", luxirpb.FieldDef_STRING, luxir.Multi()).
-      MustBuild() // or Build() if you dont want it to panic
+	// set a new schema
+	schema := luxir.NewSchema().
+		Text("title", luxir.WithAnalyzer("unicode_word", "nfkc_cf", "fold", "kstem")). // same as _t, without an analyzer text is case sensitive
+		String("author").
+		Int("year", luxir.Range()). // Range() enables numeric range queries
+		Date("published", luxir.Range()).
+		Geo("location", luxir.Range()).
+		Vector("embedding", 384, luxirpb.VectorMetric_COSINE).
+		Template("_tag", luxirpb.FieldDef_STRING, luxir.Multi()).
+		MustBuild() // or Build() if you dont want it to panic
 
-  // use it in a new collection
-  err := l.CreateCollection(ctx, "books", schema) // nil schema = Luxir's defaults
-  if errors.Is(err, luxir.ErrCollectionExists) {
-    // already there so handle it
-  }
+	// use it in a new collection
+	err = l.CreateCollection(ctx, "books", schema) // nil schema = Luxir's defaults
+	if errors.Is(err, luxir.ErrCollectionExists) {
+		// already there so handle it
+	} else if err != nil {
+		log.Fatal(err)
+	}
 
-  // get a schema
-  def, err := l.GetSchema(ctx, "books")
-  // add or update scheme
-  def, err = l.SetSchema(ctx, "books", luxir.NewSchema().Double("price").MustBuild())
-  // or replace it
-  def, err = l.ReplaceSchema(ctx, "books", schema)
+	// get a schema
+	def, err := l.GetSchema(ctx, "books")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(len(def.GetFields()), "fields")
+	// add or update scheme
+	def, err = l.SetSchema(ctx, "books", luxir.NewSchema().Double("price").MustBuild())
+	// or replace it, this drops anything it doesnt list (even the default _t, _i, ... templates)
+	def, err = l.ReplaceSchema(ctx, "books", schema)
 
-  // insert some documents
-  _, err = l.Index(ctx, "books", []luxir.Document{
-      {"id": "b1", "title_t": "Dune", "year_i": 1965, "author_s": "Herbert", "tags_ss": []string{"scifi", "classic"}},
-      {"id": "b2", "title_t": "Dune Messiah", "year_i": 1969, "author_s": "Herbert", "tags_ss": []string{"scifi"}},
-      {"id": "b3", "title_t": "Neuromancer", "year_i": 1984, "author_s": "Gibson"},
-  }, luxir.WithCommit()) // withcommit means its searchable right away
-  if err != nil {
-    // handle *UpdateError
-  }
-  // commit after writes
-  l.Commit()
+	// insert some documents, the fields match the schema above (genres_tag uses the _tag template)
+	_, err = l.Index(ctx, "books", []luxir.Document{
+		{"id": "b1", "title": "Dune", "year": 1965, "author": "Herbert", "genres_tag": []string{"scifi", "classic"}},
+		{"id": "b2", "title": "Dune Messiah", "year": 1969, "author": "Herbert", "genres_tag": []string{"scifi"}},
+		{"id": "b3", "title": "Neuromancer", "year": 1984, "author": "Gibson"},
+	}, luxir.WithCommit()) // withcommit means its searchable right away
+	if err != nil {
+		// handle *IndexError
+		log.Fatal(err)
+	}
+	// or commit later, after writes made without WithCommit
+	if _, err := l.Commit(ctx, "books"); err != nil {
+		log.Fatal(err)
+	}
 
-  // get some documents and do something with them
-  res, err := l.Search(ctx, "books", luxir.Match("title_t", "dune"), luxir.WithSort("year_i", false))
-  if err != nil {
-      log.Fatal(err)
-  }
-  fmt.Println(res.Found)
-  for _, h := range res.Hits {
-      fmt.Println(h.Score, h.Doc["id"], h.Doc["title_t"])
-  }
+	// get some documents and do something with them
+	res, err := l.Search(ctx, "books", luxir.Match("title", "dune"), luxir.WithSort("year", false))
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(res.Found)
+	for _, h := range res.Hits {
+		fmt.Println(h.Score, h.Doc["id"], h.Doc["title"])
+	}
 
-  // and so much more... you get the point
+	// and so much more... you get the point
 }
 ```
 
@@ -171,7 +183,7 @@ Default suffix templates (`_t`, `_s`, `_i`, ...) are enough to get going. For na
 
 ```golang
 schema := luxir.NewSchema().
-    Text("title").
+    Text("title", luxir.WithAnalyzer("unicode_word", "nfkc_cf", "fold", "kstem")). // same analysis as _t
     String("author").
     Int("year", luxir.Range()). // Range() enables numeric range queries
     Date("published", luxir.Range()).
@@ -194,7 +206,7 @@ stats, err := l.Stats(ctx, "books", true) // one collection, with per-segment de
 err = l.DeleteCollection(ctx, "books")    // drops every document, can't be undone
 ```
 
-A custom schema sits on top of the default templates, so `title_t` and friends keep working. `ReplaceSchema` is the exception: it removes anything it doesn't list. Schema changes don't reindex existing documents. To change a field's type, use a new field name and reindex.
+A `Text` field with no `WithAnalyzer` isn't lowercased or folded, so it's case sensitive (`"dune"` won't find `"Dune"`); give it the analyzer above to search like the `_t` fields do. A custom schema sits on top of the default templates, so `title_t` and friends keep working. `ReplaceSchema` is the exception: it removes anything it doesn't list. Schema changes don't reindex existing documents. To change a field's type, use a new field name and reindex.
 
 ## searching
 
