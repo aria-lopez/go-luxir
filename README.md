@@ -10,7 +10,7 @@ It covers the whole Luxir API: indexing (single calls and streamed bulk loads), 
 go get github.com/aria-lopez/go-luxir
 ```
 
-Needs Go 1.25+ and a running Luxir node (built against Luxir v0.1.0). Luxir serves gRPC on port **9401** by default, which is also this client's default.
+Needs Go 1.26+ and a running Luxir node (built against Luxir v0.1.0). Luxir serves gRPC on port **9401** by default, which is also this client's default.
 
 ## quickstart
 

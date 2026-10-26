@@ -77,6 +77,7 @@ func TestQuery_Proto(t *testing.T) {
 		{"range gt lte", InRange("year_i", Gt(1960), Lte(1980)), `range:{field:"year_i" gt:{i:1960} lte:{i:1980}}`},
 		{"range open", InRange("year_i", Gte(1960)), `range:{field:"year_i" gte:{i:1960}}`},
 		{"range none", InRange("year_i"), `range:{field:"year_i"}`},
+		{"range nil bound", InRange("year_i", nil, Gte(1)), `range:{field:"year_i" gte:{i:1}}`},
 		{"range time", InRange("pub", Gte(time.UnixMilli(0)), Lt(time.UnixMilli(1000))), `range:{field:"pub" gte:{i:0} lt:{i:1000}}`},
 		{"range string", InRange("pub", Gte("1969-01"), Lt("1984-01")), `range:{field:"pub" gte:{s:"1969-01"} lt:{s:"1984-01"}}`},
 		{"range last bound wins", InRange("year_i", Gte(1), Gte(2)), `range:{field:"year_i" gte:{i:2}}`},

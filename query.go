@@ -281,6 +281,9 @@ func InRange(field string, bounds ...Bound) Query {
 	return queryFunc(func() (*luxirpb.Query, error) {
 		r := &luxirpb.RangeQuery{Field: field}
 		for _, b := range bounds {
+			if b == nil {
+				continue
+			}
 			if err := b(r); err != nil {
 				return nil, &QueryError{Query: "range", Err: err}
 			}
