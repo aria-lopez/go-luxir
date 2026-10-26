@@ -207,3 +207,33 @@ func TestScan_FakeColumnsAndBadHit(t *testing.T) {
 		}
 	}
 }
+
+func TestScan_BadQueryYieldsOnce(t *testing.T) {
+	l, f := fakeLuxir(t, fakeReply())
+	n := 0
+	for _, err := range l.Scan(timeout(t), "c", Bool()) {
+		var se *SearchError
+		if !errors.As(err, &se) || !strings.Contains(err.Error(), "no clauses") {
+			t.Errorf("err = %v, want the query's *SearchError", err)
+		}
+		n++
+	}
+	if n != 1 || f.calls() != 0 {
+		t.Errorf("yielded %d times and sent %d requests, want 1 and 0", n, f.calls())
+	}
+}
+
+func TestScan_SendFailsYieldsOnce(t *testing.T) {
+	l, f := fakeLuxir(t, fakeReply())
+	n := 0
+	for _, err := range l.Scan(timeout(t), "bad\xff", nil) {
+		var se *SearchError
+		if !errors.As(err, &se) {
+			t.Errorf("err = %v, want a *SearchError", err)
+		}
+		n++
+	}
+	if n != 1 || f.calls() != 0 {
+		t.Errorf("yielded %d times and sent %d requests, want 1 and 0", n, f.calls())
+	}
+}

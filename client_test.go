@@ -110,3 +110,14 @@ func TestHealthCheck_NotServing(t *testing.T) {
 		t.Errorf("err = %q, want it to say what the node reported", got)
 	}
 }
+
+func TestNewLuxir_EmptyAddrIsDefault(t *testing.T) {
+	l, err := NewLuxir("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if got := l.conn.Target(); got != DefaultAddr {
+		t.Errorf("target = %q, want %q", got, DefaultAddr)
+	}
+}

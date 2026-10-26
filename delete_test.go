@@ -7,8 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/aria-lopez/go-luxir/luxirpb"
 )
 
 func TestDelete(t *testing.T) {
@@ -174,5 +177,28 @@ func TestDeleteError_Error(t *testing.T) {
 
 	if !errors.Is(&DeleteError{Err: cause}, cause) {
 		t.Error("errors.Is(err, cause) = false, want Unwrap to expose the cause")
+	}
+}
+
+func TestDelete_Fake(t *testing.T) {
+	var got *luxirpb.UpdateRequest
+	status := luxirpb.UpdateResponse_OK
+	l := fakeServer(t, func(s *grpc.Server) {
+		luxirpb.RegisterIndexerServer(s, &fakeIndexer{update: func(r *luxirpb.UpdateRequest) (*luxirpb.UpdateResponse, error) {
+			got = r
+			return &luxirpb.UpdateResponse{Status: status}, nil
+		}})
+	})
+
+	if _, err := l.Delete(timeout(t), "", []string{"a"}, WithCommit()); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	assertProto(t, got, parseText(t, `collection:"main" delete_ids:"a" commit:{}`, &luxirpb.UpdateRequest{}))
+
+	status = luxirpb.UpdateResponse_ERROR
+	resp, err := l.Delete(timeout(t), "c", []string{"a"})
+	var de *DeleteError
+	if !errors.As(err, &de) || de.Resp == nil || resp.GetStatus() != luxirpb.UpdateResponse_ERROR {
+		t.Errorf("Delete = %v, %v, want a *DeleteError holding the ERROR response", resp, err)
 	}
 }

@@ -5,8 +5,12 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/aria-lopez/go-luxir/luxirpb"
 )
@@ -416,5 +420,80 @@ func TestQuery_LiveRejects(t *testing.T) {
 		if !errors.As(err, &se) || se.RequestFailed() == nil {
 			t.Errorf("%s: err = %v (%T), want *SearchError carrying Luxir's error", name, err, err)
 		}
+	}
+}
+
+// TestAnyOf_SharedQuery ;; one query built by many searches at once (run with -race)
+func TestAnyOf_SharedQuery(t *testing.T) {
+	q := AnyOf("tags_ss", []any{"scifi", "classic"})
+	want := wantQuery(t, `any_of:{field:"tags_ss" values:{arr:{v:{s:"scifi"} v:{s:"classic"}}}}`)
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			for range 50 {
+				pq, err := q.toProto()
+				if err != nil || !proto.Equal(pq, want) {
+					t.Errorf("toProto = %v, %v", pq, err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// TestHugeInts_Saturate ;; an int beyond int32 saturates instead of wrapping (1<<32 used to become 0)
+func TestHugeInts_Saturate(t *testing.T) {
+	if strconv.IntSize == 32 {
+		t.Skip("int is int32")
+	}
+	var wide int64 = 1 << 32
+	huge, neg := int(wide), -int(wide)
+
+	if _, err := Fuzzy("t", "x", MaxEdits(huge)).toProto(); err == nil {
+		t.Error("MaxEdits(1<<32) passed the 0 to 2 check")
+	}
+	for name, q := range map[string]Query{
+		"Slop":         Phrase("t", "a b", Slop(neg)),
+		"MinMatch":     Match("t", "a", MinMatch(neg)),
+		"MinShould":    Bool(Should(All()), MinShould(neg)),
+		"PrefixLength": Fuzzy("t", "x", PrefixLength(neg)),
+	} {
+		if _, err := q.toProto(); err == nil {
+			t.Errorf("%s(-1<<32) passed the negative check", name)
+		}
+	}
+
+	max32 := `2147483647`
+	for name, tt := range map[string]struct {
+		q    Query
+		want string
+	}{
+		"Slop":             {Phrase("t", "a b", Slop(huge)), `phrase:{field:"t" text:"a b" slop:` + max32 + `}`},
+		"MinMatch":         {Match("t", "a", MinMatch(huge)), `match:{field:"t" val:{s:"a"} min_match:` + max32 + `}`},
+		"SimpleWith":       {SimpleWith("a", []string{"t"}, MinMatch(huge)), `simple_query:{q:"a" fields:"t" min_match:` + max32 + `}`},
+		"MinShould":        {Bool(Should(All()), MinShould(huge)), `boolean:{optional:{all:true} min_match:` + max32 + `}`},
+		"PrefixLength":     {Fuzzy("t", "x", PrefixLength(huge), MaxExpansions(huge)), `fuzzy:{field:"t" term:"x" prefix_length:` + max32 + ` max_expansions:` + max32 + `}`},
+		"RefineCandidates": {Knn("v", []float32{1}, 1, RefineCandidates(huge), Nprobe(huge)), `knn:{field:"v" k:1 query:{f32:{v:1}} refine_candidates:` + max32 + ` ivf:{nprobe:` + max32 + `}}`},
+	} {
+		pq, err := tt.q.toProto()
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		assertProto(t, pq, wantQuery(t, tt.want))
+	}
+
+	req := searchRequest(t, WithBatchSize(huge), WithOp("m", RangeFacet("d", 0, 1, CalendarGap(huge, luxirpb.CalendarGap_DAY))))
+	top := req.GetOps()[opName].GetTopDocs()
+	if top.GetBatchSize() != math.MaxInt32 || top.GetOps()["m"].GetRangeFacet().GetCalendarGap().GetN() != math.MaxInt32 {
+		t.Errorf("batch size, calendar gap = %d, %d, want both saturated", top.GetBatchSize(), top.GetOps()["m"].GetRangeFacet().GetCalendarGap().GetN())
+	}
+	l, f := fakeLuxir(t, fakeReply(&luxirpb.SearchResponse{}))
+	if _, err := l.Fuse(timeout(t), "c", []Source{FuseSource("a", nil)}, WithRRF(huge)); err != nil {
+		t.Fatal(err)
+	}
+	if k := f.last(t).GetOps()[opName].GetFusion().GetRrf().GetK(); k != math.MaxInt32 {
+		t.Errorf("rrf k = %d, want saturated", k)
 	}
 }

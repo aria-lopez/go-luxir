@@ -57,6 +57,11 @@ func (f *fakeSearcher) calls() int {
 
 func fakeLuxir(t *testing.T, reply func(*luxirpb.SearchRequest) ([]*luxirpb.SearchResponse, error)) (*Luxir, *fakeSearcher) {
 	t.Helper()
+	return fakeLuxirWith(t, reply)
+}
+
+func fakeLuxirWith(t *testing.T, reply func(*luxirpb.SearchRequest) ([]*luxirpb.SearchResponse, error), opts ...ClientOption) (*Luxir, *fakeSearcher) {
+	t.Helper()
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -68,7 +73,7 @@ func fakeLuxir(t *testing.T, reply func(*luxirpb.SearchRequest) ([]*luxirpb.Sear
 	go srv.Serve(lis)
 	t.Cleanup(srv.Stop)
 
-	l, err := NewLuxir(lis.Addr().String())
+	l, err := NewLuxir(lis.Addr().String(), opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,9 +86,14 @@ type updateStream = grpc.BidiStreamingServer[luxirpb.UpdateRequest, luxirpb.Upda
 type fakeIndexer struct {
 	luxirpb.UnimplementedIndexerServer
 	stream func(updateStream) error
+	update func(*luxirpb.UpdateRequest) (*luxirpb.UpdateResponse, error)
 }
 
 func (f *fakeIndexer) UpdateStream(s updateStream) error { return f.stream(s) }
+
+func (f *fakeIndexer) Update(_ context.Context, r *luxirpb.UpdateRequest) (*luxirpb.UpdateResponse, error) {
+	return f.update(r)
+}
 
 func fakeServer(t *testing.T, register func(*grpc.Server), opts ...ClientOption) *Luxir {
 	t.Helper()

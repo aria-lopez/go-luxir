@@ -144,6 +144,12 @@ func TestOps_Errors(t *testing.T) {
 		{"fusion empty source name", Fusion([]Source{FuseSource("", dune)}), "unique name"},
 		{"fusion dup source name", Fusion([]Source{FuseSource("a", dune), FuseSource("a", messiah)}), "unique name"},
 		{"fusion bad source query", Fusion([]Source{FuseSource("a", Knn("e", nil, 1))}), "vector is empty"},
+		{"fusion bad sub op", Fusion([]Source{FuseSource("a", dune)}, WithOp("m", nil)), "needs a name and an op"},
+		{"fusion bad filter", Fusion([]Source{FuseSource("a", dune)}, WithFilter(Knn("e", nil, 1))), "vector is empty"},
+		{"docs bad sub op", Docs(nil, WithOp("", Avg("p"))), "needs a name and an op"},
+		{"query facet bad selected", QueryFacet([]NamedQuery{Named("a", dune)}, Select(struct{}{})), "selected"},
+		{"in domain bad op", InDomain(FieldFacet("a", Gap(1)), WithDomainQuery(All())), "Gap does not apply"},
+		{"in domain bad domain", InDomain(Avg("p"), WithDomainQuery(Knn("e", nil, 1))), "vector is empty"},
 
 		{"limit on range", RangeFacet("y", 0, 1, Gap(1), FacetLimit(1)), "FacetLimit does not apply"},
 		{"limit on query", QueryFacet([]NamedQuery{Named("a", dune)}, FacetLimit(1)), "FacetLimit does not apply"},

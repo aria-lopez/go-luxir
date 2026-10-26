@@ -17,7 +17,7 @@ import (
 
 func facetOf(t *testing.T, text string) *Facet {
 	t.Helper()
-	f, err := decodeFacet(parseText(t, text, &luxirpb.FacetResult{}))
+	f, err := decodeFacet(parseText(t, text, &luxirpb.FacetResult{}), nil)
 	if err != nil {
 		t.Fatalf("decodeFacet: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestDecodeFacet_Errors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := decodeFacet(parseText(t, tt.text, &luxirpb.FacetResult{}))
+			_, err := decodeFacet(parseText(t, tt.text, &luxirpb.FacetResult{}), nil)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Errorf("err = %v, want it to contain %q", err, tt.want)
 			}
@@ -159,14 +159,14 @@ func TestDecodeVal(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := decodeVal(parseText(t, tt.text, &luxirpb.Val{}))
+			got, err := decodeVal(parseText(t, tt.text, &luxirpb.Val{}), nil)
 			if err != nil || !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("decodeVal = %#v, %v, want %#v", got, err, tt.want)
 			}
 		})
 	}
 
-	if got, err := decodeVal(parseText(t, `arr:{v:{docs:{}}}`, &luxirpb.Val{})); err == nil {
+	if got, err := decodeVal(parseText(t, `arr:{v:{docs:{}}}`, &luxirpb.Val{}), nil); err == nil {
 		t.Errorf("decodeVal(docs in an array) = %v, want an error", got)
 	}
 }
@@ -211,7 +211,7 @@ func TestDecodeDocs(t *testing.T) {
 		docs:{fields:{key:"id" value:{s:"a"}} fields:{key:"_score_" value:{f:1.5}}}
 		docs:{fields:{key:"id" value:{s:"b"}} fields:{key:"_score_" value:{f:0.5}}}`, &luxirpb.DocList{})
 
-	r, err := decodeDocs(dl)
+	r, err := decodeDocs(dl, nil)
 	if err != nil {
 		t.Fatalf("decodeDocs: %v", err)
 	}
@@ -224,10 +224,10 @@ func TestDecodeDocs(t *testing.T) {
 }
 
 func TestDecodeDocs_FoundAbsentVersusZero(t *testing.T) {
-	if r, _ := decodeDocs(parseText(t, ``, &luxirpb.DocList{})); !r.uncounted {
+	if r, _ := decodeDocs(parseText(t, ``, &luxirpb.DocList{}), nil); !r.uncounted {
 		t.Error("uncounted = false, want true when found is absent")
 	}
-	if r, _ := decodeDocs(parseText(t, `found:0`, &luxirpb.DocList{})); r.uncounted || r.Found != 0 {
+	if r, _ := decodeDocs(parseText(t, `found:0`, &luxirpb.DocList{}), nil); r.uncounted || r.Found != 0 {
 		t.Errorf("result = %+v, want counted zero", r)
 	}
 }
@@ -235,7 +235,7 @@ func TestDecodeDocs_FoundAbsentVersusZero(t *testing.T) {
 func TestDecodeDocs_Columns(t *testing.T) {
 	dl := parseText(t, `row_count:1 columns:{key:"id" value:{col_s:{v:"a"}}}`, &luxirpb.DocList{})
 
-	if r, err := decodeDocs(dl); err == nil {
+	if r, err := decodeDocs(dl, nil); err == nil {
 		t.Errorf("decodeDocs = %+v, want an error: columns would lose documents silently", r)
 	}
 }
@@ -243,7 +243,7 @@ func TestDecodeDocs_Columns(t *testing.T) {
 func TestDecodeDocs_BadHit(t *testing.T) {
 	dl := parseText(t, `docs:{fields:{key:"id" value:{docs:{}}}}`, &luxirpb.DocList{})
 
-	if _, err := decodeDocs(dl); err == nil || !strings.Contains(err.Error(), "hit 0") {
+	if _, err := decodeDocs(dl, nil); err == nil || !strings.Contains(err.Error(), "hit 0") {
 		t.Errorf("err = %v, want it to name hit 0", err)
 	}
 }
@@ -390,5 +390,174 @@ func TestSearch_ServerErrorStatus(t *testing.T) {
 	var se *SearchError
 	if !errors.As(err, &se) || status.Code(err) != codes.ResourceExhausted {
 		t.Errorf("err = %v, want *SearchError keeping the gRPC status", err)
+	}
+}
+
+// docsVal ;; a doc list as an op result
+func docsVal(d *luxirpb.DocList) *luxirpb.Val { return &luxirpb.Val{Kind: &luxirpb.Val_Docs{Docs: d}} }
+
+func withOffset(d *luxirpb.DocList, n int64) *luxirpb.DocList {
+	d.Offset = n
+	return d
+}
+
+func withOps(d *luxirpb.DocList, ops map[string]*luxirpb.Val) *luxirpb.DocList {
+	d.Ops = ops
+	return d
+}
+
+// TestSearch_NestedDocsMergeAcrossBatches ;; a Docs op under the search streams its own batches, every one is kept, at any depth
+func TestSearch_NestedDocsMergeAcrossBatches(t *testing.T) {
+	nested := func(more bool, kid string, offset int64, grandkids ...string) *luxirpb.SearchResponse {
+		inner := withOps(withOffset(docList(kid), offset), map[string]*luxirpb.Val{"grand": docsVal(withOffset(docList(grandkids...), offset))})
+		return hitsResp(more, withOps(docList(), map[string]*luxirpb.Val{"kids": docsVal(inner)}))
+	}
+	last := nested(false, "d", 3, "z")
+	last.Ops[opName].GetDocs().Found = new(int64(4))
+	last.Ops[opName].GetDocs().Ops["kids"].GetDocs().Found = new(int64(4))
+	last.Ops[opName].GetDocs().Ops["kids"].GetDocs().Ops["g"] = &luxirpb.Val{Kind: &luxirpb.Val_D{D: 1.5}}
+	l, _ := fakeLuxir(t, fakeReply(nested(true, "a", 0, "w"), nested(true, "b", 1, "x"), nested(true, "c", 2, "y"), last))
+
+	r, err := l.Search(timeout(t), "c", nil, WithLimit(0), WithOp("kids", Docs(nil, WithLimit(-1), WithBatchSize(1),
+		WithOp("grand", Docs(nil, WithLimit(-1))), WithOp("g", Avg("n_i")))))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	kids := r.Ops.Docs("kids")
+	if kids == nil {
+		t.Fatalf("Ops = %v, want kids", r.Ops)
+	}
+	if got := ids(kids); !reflect.DeepEqual(got, []string{"a", "b", "c", "d"}) {
+		t.Errorf("kids = %v, want every batch", got)
+	}
+	if kids.Found != 4 || kids.Offset != 0 {
+		t.Errorf("kids Found, Offset = %d, %d, want 4, 0 (the first batch's offset)", kids.Found, kids.Offset)
+	}
+	if got := ids(kids.Ops.Docs("grand")); !reflect.DeepEqual(got, []string{"w", "x", "y", "z"}) {
+		t.Errorf("grand = %v, want every batch two levels down", got)
+	}
+	if g, ok := kids.Ops.Float("g"); !ok || g != 1.5 {
+		t.Errorf("g = %v, %v, want the final batch's metric", g, ok)
+	}
+}
+
+// TestSearch_RowsWithoutFields ;; a row whose fields all miss the projection comes as a count, it is still a hit
+func TestSearch_RowsWithoutFields(t *testing.T) {
+	empty := func(n int32) *luxirpb.DocList { return &luxirpb.DocList{RowCount: n} }
+	partial := docList("a")
+	partial.RowCount = 2 // ;; a map short, recovered as an empty row
+	l, _ := fakeLuxir(t, fakeReply(
+		hitsResp(true, empty(2)),
+		hitsResp(true, partial),
+		hitsResp(false, withOps(withFound(empty(1), 5), map[string]*luxirpb.Val{"kids": docsVal(empty(3))})),
+	))
+
+	r, err := l.Search(timeout(t), "c", nil, WithFields("none_*"), WithScores(false), WithOp("kids", Docs(nil)))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(r.Hits) != 5 || r.Found != 5 {
+		t.Fatalf("hits, Found = %d, %d, want 5, 5", len(r.Hits), r.Found)
+	}
+	if got := ids(r); !reflect.DeepEqual(got, []string{"", "", "a", "", ""}) {
+		t.Errorf("ids = %q, want the empty rows in place", got)
+	}
+	for i, h := range r.Hits {
+		if h.Doc == nil {
+			t.Errorf("hit %d Doc is nil, want an empty document", i)
+		}
+	}
+	if kids := r.Ops.Docs("kids"); kids == nil || len(kids.Hits) != 3 {
+		t.Errorf("kids = %+v, want 3 empty hits", kids)
+	}
+
+	n := 0
+	for h, err := range l.Scan(timeout(t), "c", nil, WithFields("none_*"), WithScores(false)) {
+		if err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		if h.Doc == nil {
+			t.Error("Scan hit Doc is nil, want an empty document")
+		}
+		n++
+	}
+	if n != 5 {
+		t.Errorf("Scan yielded %d hits, want 5", n)
+	}
+}
+
+// TestHasMore_UncountedEverywhere ;; every doc list knows the page size it asked for, not only Search's own
+func TestHasMore_UncountedEverywhere(t *testing.T) {
+	facet := wantResponse(t, `ops:{key:"f" value:{facet:{bucket_ids:{col_s:{v:"x" v:"y"}} counts:2 counts:1
+		ops:{key:"top" value:{arr:{v:{docs:{docs:{} docs:{}}} v:{docs:{docs:{}}}}}}}}}`)
+	tests := []struct {
+		name string
+		do   func(l *Luxir) (*SearchResult, error)
+		resp *luxirpb.SearchResponse
+		want bool
+	}{
+		{"Do full page", func(l *Luxir) (*SearchResult, error) {
+			r, err := l.Do(timeout(t), "c", map[string]Op{"p": Docs(nil, WithLimit(2), WithCount(false))})
+			return r.Ops.Docs("p"), err
+		}, opsResp(false, map[string]*luxirpb.Val{"p": docsVal(docList("a", "b"))}), true},
+		{"Do short page", func(l *Luxir) (*SearchResult, error) {
+			r, err := l.Do(timeout(t), "c", map[string]Op{"p": Docs(nil, WithLimit(3), WithCount(false))})
+			return r.Ops.Docs("p"), err
+		}, opsResp(false, map[string]*luxirpb.Val{"p": docsVal(docList("a", "b"))}), false},
+		{"Do default limit", func(l *Luxir) (*SearchResult, error) {
+			r, err := l.Do(timeout(t), "c", map[string]Op{"p": Docs(nil, WithCount(false))})
+			return r.Ops.Docs("p"), err
+		}, opsResp(false, map[string]*luxirpb.Val{"p": docsVal(docList("a", "b", "c", "d", "e", "f", "g", "h", "i", "j"))}), true},
+		{"nested in Search", func(l *Luxir) (*SearchResult, error) {
+			r, err := l.Search(timeout(t), "c", nil, WithOp("k", Docs(nil, WithLimit(1), WithCount(false))))
+			return r.Ops.Docs("k"), err
+		}, hitsResp(false, withOps(docList(), map[string]*luxirpb.Val{"k": docsVal(docList("a"))})), true},
+		{"Fusion op", func(l *Luxir) (*SearchResult, error) {
+			r, err := l.Do(timeout(t), "c", map[string]Op{"p": Fusion([]Source{FuseSource("a", nil)}, WithLimit(1), WithCount(false))})
+			return r.Ops.Docs("p"), err
+		}, opsResp(false, map[string]*luxirpb.Val{"p": docsVal(docList("a"))}), true},
+		{"per facet bucket", func(l *Luxir) (*SearchResult, error) {
+			r, err := l.Do(timeout(t), "c", map[string]Op{"f": FieldFacet("f_s", SubOp("top", Docs(nil, WithLimit(2), WithCount(false))))})
+			return r.Ops.Facet("f").Buckets[0].Ops.Docs("top"), err
+		}, facet, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l, _ := fakeLuxir(t, fakeReply(tt.resp))
+			r, err := tt.do(l)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.HasMore() != tt.want {
+				t.Errorf("HasMore = %v with %d hits, want %v", r.HasMore(), len(r.Hits), tt.want)
+			}
+		})
+	}
+}
+
+func TestPageLimitAndSubOps(t *testing.T) {
+	two := int64(2)
+	subs := map[string]*luxirpb.SearchOp{"s": {}}
+	tests := []struct {
+		op    *luxirpb.SearchOp
+		limit int64
+	}{
+		{nil, 0},
+		{&luxirpb.SearchOp{Kind: &luxirpb.SearchOp_TopDocs{TopDocs: &luxirpb.TopDocs{Ops: subs}}}, 10},
+		{&luxirpb.SearchOp{Kind: &luxirpb.SearchOp_TopDocs{TopDocs: &luxirpb.TopDocs{Limit: &two, Ops: subs}}}, 2},
+		{&luxirpb.SearchOp{Kind: &luxirpb.SearchOp_Fusion{Fusion: &luxirpb.Fusion{Limit: &two, Ops: subs}}}, 2},
+		{&luxirpb.SearchOp{Kind: &luxirpb.SearchOp_FieldFacet{FieldFacet: &luxirpb.FieldFacet{Ops: subs}}}, 0},
+		{&luxirpb.SearchOp{Kind: &luxirpb.SearchOp_RangeFacet{RangeFacet: &luxirpb.RangeFacet{Ops: subs}}}, 0},
+		{&luxirpb.SearchOp{Kind: &luxirpb.SearchOp_QueryFacet{QueryFacet: &luxirpb.QueryFacet{Ops: subs}}}, 0},
+		{&luxirpb.SearchOp{Kind: &luxirpb.SearchOp_ExprOp{ExprOp: &luxirpb.ExprOp{}}}, 0},
+	}
+	for i, tt := range tests {
+		if got := pageLimit(tt.op); got != tt.limit {
+			t.Errorf("%d: pageLimit = %d, want %d", i, got, tt.limit)
+		}
+		_, isExpr := tt.op.GetKind().(*luxirpb.SearchOp_ExprOp)
+		if got := subOps(tt.op); (got != nil) == (tt.op == nil || isExpr) {
+			t.Errorf("%d: subOps = %v", i, got)
+		}
 	}
 }

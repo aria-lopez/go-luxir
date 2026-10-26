@@ -2,6 +2,7 @@ package luxir
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"google.golang.org/protobuf/types/known/structpb"
@@ -12,6 +13,7 @@ import (
 // Document ;; one record to index, [field name]->[value]
 // ;; the field names suffix tells Luxir the type (like title_t, year_i, etc)
 // ;; values: string, bool, ints, floats, time.Time, Point, their slices, []float32 vectors, [][]float32 multi-vectors
+// ;; slices are copied when the document is converted, so a buffer can be reused once Index returns or IndexStream's iterator moves on
 type Document map[string]any
 
 // toMap ;; change a document to a protobuf *Map
@@ -28,6 +30,8 @@ func (d Document) toMap() (*luxirpb.Map, error) {
 }
 
 // toVal ;; Change goes native value to a protobuf *Val
+//
+// ;; slices are copied, IndexStream holds a converted document in a batch long after the caller has moved on
 func toVal(v any) (*luxirpb.Val, error) {
 	switch x := v.(type) {
 	case nil:
@@ -37,7 +41,7 @@ func toVal(v any) (*luxirpb.Val, error) {
 	case bool:
 		return &luxirpb.Val{Kind: &luxirpb.Val_B{B: x}}, nil
 	case []byte:
-		return &luxirpb.Val{Kind: &luxirpb.Val_Bin{Bin: x}}, nil
+		return &luxirpb.Val{Kind: &luxirpb.Val_Bin{Bin: slices.Clone(x)}}, nil
 	case int:
 		return &luxirpb.Val{Kind: &luxirpb.Val_I{I: int64(x)}}, nil
 	case int8:
@@ -61,9 +65,9 @@ func toVal(v any) (*luxirpb.Val, error) {
 	case float64:
 		return &luxirpb.Val{Kind: &luxirpb.Val_D{D: x}}, nil
 	case []string:
-		return &luxirpb.Val{Kind: &luxirpb.Val_ArrS{ArrS: &luxirpb.ArrStr{V: x}}}, nil
+		return &luxirpb.Val{Kind: &luxirpb.Val_ArrS{ArrS: &luxirpb.ArrStr{V: slices.Clone(x)}}}, nil
 	case []int64:
-		return &luxirpb.Val{Kind: &luxirpb.Val_ArrI{ArrI: &luxirpb.ArrInt{V: x}}}, nil
+		return &luxirpb.Val{Kind: &luxirpb.Val_ArrI{ArrI: &luxirpb.ArrInt{V: slices.Clone(x)}}}, nil
 	case []int:
 		ints := make([]int64, len(x))
 		for i, n := range x {
@@ -71,11 +75,15 @@ func toVal(v any) (*luxirpb.Val, error) {
 		}
 		return &luxirpb.Val{Kind: &luxirpb.Val_ArrI{ArrI: &luxirpb.ArrInt{V: ints}}}, nil
 	case []float32:
-		return &luxirpb.Val{Kind: &luxirpb.Val_ArrF{ArrF: &luxirpb.ArrFloat{V: x}}}, nil
+		return &luxirpb.Val{Kind: &luxirpb.Val_ArrF{ArrF: &luxirpb.ArrFloat{V: slices.Clone(x)}}}, nil
 	case []float64:
-		return &luxirpb.Val{Kind: &luxirpb.Val_ArrD{ArrD: &luxirpb.ArrDouble{V: x}}}, nil
+		return &luxirpb.Val{Kind: &luxirpb.Val_ArrD{ArrD: &luxirpb.ArrDouble{V: slices.Clone(x)}}}, nil
 	case [][]byte:
-		return &luxirpb.Val{Kind: &luxirpb.Val_ArrBin{ArrBin: &luxirpb.ArrBin{V: x}}}, nil
+		bins := make([][]byte, len(x))
+		for i, b := range x {
+			bins[i] = slices.Clone(b)
+		}
+		return &luxirpb.Val{Kind: &luxirpb.Val_ArrBin{ArrBin: &luxirpb.ArrBin{V: bins}}}, nil
 	case Point:
 		return arrD(x.Lon, x.Lat), nil
 	case []Point:
@@ -87,13 +95,13 @@ func toVal(v any) (*luxirpb.Val, error) {
 	case [][]float64:
 		vals := make([]*luxirpb.Val, len(x))
 		for i, v := range x {
-			vals[i] = arrD(v...)
+			vals[i] = arrD(slices.Clone(v)...)
 		}
 		return &luxirpb.Val{Kind: &luxirpb.Val_Arr{Arr: &luxirpb.ArrVal{V: vals}}}, nil
 	case [][]float32:
 		vecs := make([]*luxirpb.Vector, len(x))
 		for i, v := range x {
-			vecs[i] = &luxirpb.Vector{Kind: &luxirpb.Vector_F32{F32: &luxirpb.ArrFloat{V: v}}}
+			vecs[i] = &luxirpb.Vector{Kind: &luxirpb.Vector_F32{F32: &luxirpb.ArrFloat{V: slices.Clone(v)}}}
 		}
 		return &luxirpb.Val{Kind: &luxirpb.Val_ArrVec{ArrVec: &luxirpb.ArrVector{V: vecs}}}, nil
 	case []any:

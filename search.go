@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"time"
 
@@ -216,7 +217,7 @@ func WithMaxParallel(n int) SearchOption {
 
 // WithBatchSize ;; most documents per streamed batch, Luxir caps it at 256
 func WithBatchSize(n int) SearchOption {
-	return func(p *searchParams) { p.use("WithBatchSize", docScopes|forScan); p.batchSize = int32(n) }
+	return func(p *searchParams) { p.use("WithBatchSize", docScopes|forScan); p.batchSize = clamp32(n) }
 }
 
 // WithRequestID ;; opaque id Luxir echoes back
@@ -247,7 +248,7 @@ func WithRRF(k int) SearchOption {
 			p.errs = append(p.errs, fmt.Errorf("WithRRF must not be negative: %d", k))
 			return
 		}
-		v := int32(k)
+		v := clamp32(k)
 		p.rrf = &v
 	}
 }
@@ -298,14 +299,6 @@ func (p *searchParams) request(collection string, ops map[string]*luxirpb.Search
 		MaxParallel: p.maxParallel,
 		Ops:         ops,
 	}
-}
-
-// pageLimit ;; how many hits a full page holds (Luxir's default is 10)
-func (p *searchParams) pageLimit() int64 {
-	if p.limit == nil {
-		return 10
-	}
-	return *p.limit
 }
 
 // buildOps ;; convert named ops in name order so errors are the same every run
@@ -415,7 +408,7 @@ func recvSearch(stream luxirpb.Searcher_SearchClient) (*luxirpb.SearchResponse, 
 
 // run ;; send one request and merge its streamed batches
 //
-// ;; doc lists merge across batches, everything else arrives in the final one
+// ;; doc lists merge across batches at any depth, everything else arrives in the final one
 func (l *Luxir) run(ctx context.Context, req *luxirpb.SearchRequest) (*Response, error) {
 	// one stream per call, also it will cancel so there is no leaking
 	ctx, cancel := context.WithCancel(ctx)
@@ -428,8 +421,7 @@ func (l *Luxir) run(ctx context.Context, req *luxirpb.SearchRequest) (*Response,
 
 	// results come back in batches potentially, so iter through the recv
 	out := &Response{}
-	docs := map[string]*luxirpb.DocList{}
-	vals := map[string]*luxirpb.Val{}
+	ops := map[string]*luxirpb.Val{}
 	for {
 		resp, err := recvSearch(stream)
 		if err != nil {
@@ -440,50 +432,61 @@ func (l *Luxir) run(ctx context.Context, req *luxirpb.SearchRequest) (*Response,
 		if pr := resp.GetProfile(); pr != nil {
 			out.Profile = pr
 		}
-
-		for name, v := range resp.GetOps() {
-			dl := v.GetDocs()
-			if dl == nil {
-				vals[name] = v
-				continue
-			}
-			m := docs[name]
-			if m == nil {
-				m = &luxirpb.DocList{Offset: dl.GetOffset()}
-				docs[name] = m
-			}
-			if dl.Found != nil {
-				m.Found = dl.Found
-			}
-			if len(dl.GetColumns()) > 0 {
-				m.Columns = dl.GetColumns()
-			}
-			if len(dl.GetOps()) > 0 {
-				m.Ops = dl.GetOps()
-			}
-			m.Docs = append(m.Docs, dl.GetDocs()...)
-		}
+		mergeOps(ops, resp.GetOps())
 		if !resp.GetMore() {
 			break
 		}
 	}
 
-	out.Ops = OpResults{}
-	for name, dl := range docs {
-		res, err := decodeDocs(dl)
-		if err != nil {
-			return nil, &SearchError{Msg: fmt.Sprintf("err on op %q: %v", name, err), Err: err}
-		}
-		out.Ops[name] = res
+	// ;; decoded against the request so every doc list knows the page size it asked for
+	if out.Ops, err = decodeOps(ops, req.GetOps()); err != nil {
+		return nil, &SearchError{Msg: fmt.Sprintf("err on %v", err), Err: err}
 	}
-	for name, v := range vals {
-		val, err := decodeVal(v)
-		if err != nil {
-			return nil, &SearchError{Msg: fmt.Sprintf("err on op %q: %v", name, err), Err: err}
-		}
-		out.Ops[name] = val
+	if out.Ops == nil {
+		out.Ops = OpResults{}
 	}
 	return out, nil
+}
+
+// mergeOps ;; fold one batch's op results into into, doc lists append at any depth, everything else is replaced
+func mergeOps(into, batch map[string]*luxirpb.Val) {
+	for name, v := range batch {
+		dl := v.GetDocs()
+		if dl == nil {
+			into[name] = v
+			continue
+		}
+		m := into[name].GetDocs()
+		if m == nil {
+			m = &luxirpb.DocList{Offset: dl.GetOffset()}
+			into[name] = &luxirpb.Val{Kind: &luxirpb.Val_Docs{Docs: m}}
+		}
+		if dl.Found != nil {
+			m.Found = dl.Found
+		}
+		if len(dl.GetColumns()) > 0 {
+			m.Columns = dl.GetColumns()
+		}
+		m.Docs = append(m.Docs, rows(dl)...)
+		if len(dl.GetOps()) > 0 {
+			if m.Ops == nil {
+				m.Ops = map[string]*luxirpb.Val{}
+			}
+			mergeOps(m.Ops, dl.GetOps())
+		}
+	}
+}
+
+// rows ;; one map per document in the batch, a row whose fields all missed the projection has none so it gets an empty one
+func rows(dl *luxirpb.DocList) []*luxirpb.Map {
+	docs := dl.GetDocs()
+	if n := int(dl.GetRowCount()) - len(docs); n > 0 {
+		docs = slices.Clip(docs)
+		for range n {
+			docs = append(docs, &luxirpb.Map{})
+		}
+	}
+	return docs
 }
 
 // page ;; the result of the one op Search and Fuse send, with the request-level bits on it
@@ -495,7 +498,6 @@ func (p *searchParams) page(resp *Response) *SearchResult {
 	res.Offset = p.offset
 	res.Warnings = resp.Warnings
 	res.Profile = resp.Profile
-	res.limit = p.pageLimit()
 	return res
 }
 

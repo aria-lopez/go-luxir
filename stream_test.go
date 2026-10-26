@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -628,6 +629,234 @@ func TestIndexStream_NewCollectionsDontHang(t *testing.T) {
 		l.DeleteCollection(ctx, coll)
 		if err != nil {
 			t.Fatalf("iteration %d: %v", i, err)
+		}
+	}
+}
+
+// TestLaneOf_EquivalentIDs ;; every spelling Luxir reads as one id takes one stream (Luxir writes 1000030.0 as "1000030")
+func TestLaneOf_EquivalentIDs(t *testing.T) {
+	long := strings.Repeat("é", 126) // ;; 252 bytes
+	groups := [][]any{
+		{float64(1000030), 1000030, int64(1000030), "1000030", float32(1000030), "1.00003e+06"},
+		{float64(2000001), 2000001, "2000001"},
+		{1.5, "1.5", float32(1.5)},
+		{float32(1.1), "1.1"},
+		{123456789.25, "123456789.25"},
+		{1e21, "1e+21"},
+		{1e-7, "1e-07"},
+		{float64(1 << 62), int64(1 << 62), "4611686018427387904"},
+		{0.0, math.Copysign(0, -1), 0, "0", "-0"},
+		{math.Inf(1), "inf"},
+		{math.Inf(-1), "-inf"},
+		{math.NaN(), "nan", float32(math.NaN())},
+		{true, "true"},
+		{false, "false"},
+		{time.UnixMilli(1700000000000), int64(1700000000000), "1700000000000"},
+		{uint32(7), uint8(7), uint16(7), int8(7), int16(7), "7", []byte("7")},
+		{"k1", []byte("k1")},
+		// ;; long_terms truncate merges ids sharing 255 bytes backed off to a UTF-8 boundary
+		{long + "a", long + "é", long + "aaaaaaaaaaaaa"},
+	}
+	for _, g := range groups {
+		for _, n := range []int{2, 3, streamLanes, 16} {
+			rr := 0
+			want := laneOf(Document{"id": g[0]}, n, &rr)
+			for _, id := range g[1:] {
+				if got := laneOf(Document{"id": id}, n, &rr); got != want {
+					t.Errorf("%d lanes: laneOf(%T %v) = %d, laneOf(%T %v) = %d, want one stream", n, id, id, got, g[0], g[0], want)
+				}
+			}
+		}
+	}
+	// ;; an unsupported id never gets past toMap, it still has to route somewhere
+	rr := 0
+	if got := laneOf(Document{"id": struct{}{}}, streamLanes, &rr); got < 0 || got >= streamLanes {
+		t.Errorf("laneOf(struct{}) = %d", got)
+	}
+}
+
+// TestIndexStream_EquivalentIDsLastWins ;; float, int and string spellings of one id interleaved, the last one wins like with Index
+func TestIndexStream_EquivalentIDsLastWins(t *testing.T) {
+	l := getClient(t)
+	coll := newCollection(t, l)
+	var docs []Document
+	for i := range 2000 {
+		n := 1000001 + i
+		docs = append(docs,
+			Document{"id": float64(n), "n_i": 1},
+			Document{"id": n, "n_i": 2},
+			Document{"id": float64(n), "n_i": 3},
+			Document{"id": strconv.Itoa(n), "n_i": 4})
+	}
+	if _, err := l.IndexStream(timeout(t), coll, slices.Values(docs), WithCommit()); err != nil {
+		t.Fatalf("IndexStream: %v", err)
+	}
+	r, err := l.Search(timeout(t), coll, nil, WithLimit(5), WithFields("id", "n_i"), WithFilter(Not(Match("n_i", 4))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := l.Search(timeout(t), coll, nil, WithLimit(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Found != 0 || all.Found != 2000 {
+		t.Errorf("%d of %d ids kept an older version, e.g. %v; want 0 of 2000", r.Found, all.Found, r.Hits)
+	}
+}
+
+// TestIndexStream_ReusedBuffers ;; an iterator may reuse its slices once yield returns, nothing it yielded changes
+func TestIndexStream_ReusedBuffers(t *testing.T) {
+	l := getClient(t)
+	coll := newCollection(t, l)
+	ints, strs, raw := []int64{0}, []string{""}, []byte{0}
+	seq := func(yield func(Document) bool) {
+		for i := range 50 {
+			ints[0], strs[0], raw[0] = int64(i), strconv.Itoa(i), byte(i)
+			if !yield(Document{"id": strconv.Itoa(i), "n_is": ints, "s_ss": strs, "raw_s": raw}) {
+				return
+			}
+		}
+	}
+	if _, err := l.IndexStream(timeout(t), coll, seq, WithCommit()); err != nil {
+		t.Fatalf("IndexStream: %v", err)
+	}
+	r, err := l.Search(timeout(t), coll, nil, WithLimit(-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Hits) != 50 {
+		t.Fatalf("got %d docs, want 50", len(r.Hits))
+	}
+	for _, h := range r.Hits {
+		id := h.Doc["id"].(string)
+		n, _ := strconv.Atoi(id)
+		if fmt.Sprint(h.Doc["n_is"]) != "["+id+"]" || fmt.Sprint(h.Doc["s_ss"]) != "["+id+"]" || h.Doc["raw_s"] != string([]byte{byte(n)}) {
+			t.Errorf("id %s = %v, want its own values, not the buffer's last", id, h.Doc)
+		}
+	}
+}
+
+// TestIndexStream_FakeDefaultCollection ;; "" is made as "main" before going parallel
+func TestIndexStream_FakeDefaultCollection(t *testing.T) {
+	var created atomic.Value
+	l := fakeServer(t, func(s *grpc.Server) {
+		luxirpb.RegisterIndexerServer(s, &fakeIndexer{stream: okStream})
+		luxirpb.RegisterAdminServer(s, &recordAdmin{created: &created})
+	})
+	if _, err := l.IndexStream(timeout(t), "", slices.Values(numbered(10))); err != nil {
+		t.Fatalf("IndexStream: %v", err)
+	}
+	if created.Load() != "main" {
+		t.Errorf("created %v, want main", created.Load())
+	}
+}
+
+type recordAdmin struct {
+	luxirpb.UnimplementedAdminServer
+	created *atomic.Value
+}
+
+func (a *recordAdmin) CreateCollection(_ context.Context, r *luxirpb.CreateCollectionRequest) (*luxirpb.CreateCollectionResponse, error) {
+	a.created.Store(r.GetName())
+	return &luxirpb.CreateCollectionResponse{}, nil
+}
+
+// okStream ;; answers every batch OK
+func okStream(s updateStream) error {
+	for {
+		r, err := s.Recv()
+		if err != nil {
+			return nil
+		}
+		if err := s.Send(&luxirpb.UpdateResponse{RequestId: r.GetRequestId(), Status: luxirpb.UpdateResponse_OK}); err != nil {
+			return err
+		}
+	}
+}
+
+// TestIndexStream_UnsendableDocument ;; a batch gRPC can't encode (strings must be UTF-8) fails the call, nothing is committed
+func TestIndexStream_UnsendableDocument(t *testing.T) {
+	var commits atomic.Int32
+	l := fakeIndexerLuxir(t, func(s updateStream) error {
+		for {
+			r, err := s.Recv()
+			if err != nil {
+				return nil
+			}
+			if r.GetCommit() != nil {
+				commits.Add(1)
+			}
+			s.Send(&luxirpb.UpdateResponse{RequestId: r.GetRequestId(), Status: luxirpb.UpdateResponse_OK})
+		}
+	})
+	docs := numbered(5000)
+	docs[0]["t_s"] = "bad\xff"
+
+	_, err := l.IndexStream(timeout(t), "c", slices.Values(docs), WithCommit())
+	var ie *IndexError
+	if !errors.As(err, &ie) || status.Code(ie.Err) != codes.Internal {
+		t.Errorf("err = %v, want an *IndexError with the marshal failure", err)
+	}
+	if commits.Load() != 0 {
+		t.Error("committed after a failed batch")
+	}
+}
+
+// TestStreamLane_SkipsOnceStopped ;; a queued batch isn't sent after another lane failed, and stops counting as pending
+func TestStreamLane_SkipsOnceStopped(t *testing.T) {
+	m := newStreamMerge()
+	m.enqueue(&luxirpb.UpdateRequest{}, []int{0})
+	first := errors.New("first")
+	m.fail(first)
+	m.fail(errors.New("second"))
+	(&streamLane{}).sendOne(m, &luxirpb.UpdateRequest{}) // ;; a nil stream would panic if it were used
+	if m.pending != 0 || m.failed() != first {
+		t.Errorf("pending, err = %d, %v, want 0 and the first failure", m.pending, m.failed())
+	}
+}
+
+// TestStreamMerge_ErrorOutsideBatch ;; an error index Luxir sends outside the batch is passed through, not remapped
+func TestStreamMerge_ErrorOutsideBatch(t *testing.T) {
+	m := newStreamMerge()
+	r := &luxirpb.UpdateRequest{}
+	m.enqueue(r, []int{7})
+	m.add(streamAck{resp: &luxirpb.UpdateResponse{RequestId: r.GetRequestId(), Status: luxirpb.UpdateResponse_PARTIAL,
+		Errors: []*luxirpb.UpdateResponse_DocError{{Index: 0}, {Index: 5}}}})
+	if got := m.result().GetErrors(); len(got) != 2 || got[0].GetIndex() != 5 || got[1].GetIndex() != 7 {
+		t.Errorf("errors = %v, want indexes 5 (passed through) and 7 (remapped)", got)
+	}
+}
+
+// TestIndexStream_CancelledWhileBlocked ;; a server that stops reading can't hang the producer past the deadline
+func TestIndexStream_CancelledWhileBlocked(t *testing.T) {
+	l := fakeIndexerLuxir(t, func(s updateStream) error {
+		<-s.Context().Done()
+		return nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := l.IndexStream(ctx, "c", slices.Values(bigDocs(40, 1<<20)), WithFieldMap(map[string]string{"body_s": "body_s"}))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("IndexStream = nil, want the deadline")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("IndexStream still blocked 5s after its deadline")
+	}
+}
+
+func TestValBound_NeverUnder(t *testing.T) {
+	for _, v := range []*luxirpb.Val{
+		{Kind: &luxirpb.Val_Vec{Vec: &luxirpb.Vector{Kind: &luxirpb.Vector_F32{F32: &luxirpb.ArrFloat{V: make([]float32, 100)}}}}},
+		{Kind: &luxirpb.Val_Map{Map: &luxirpb.Map{Fields: map[string]*luxirpb.Val{"k": {Kind: &luxirpb.Val_S{S: strings.Repeat("x", 500)}}}}}},
+	} {
+		if got, real := valBound(v), proto.Size(v); got < real {
+			t.Errorf("valBound(%T) = %d, under the real size %d", v.GetKind(), got, real)
 		}
 	}
 }

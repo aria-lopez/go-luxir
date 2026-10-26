@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
+	"hash/maphash"
 	"io"
 	"iter"
+	"math"
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -167,37 +169,79 @@ func laneOf(d Document, n int, rr *int) int {
 	if n == 1 {
 		return 0
 	}
-	var key string
-	switch id := d["id"].(type) {
-	case nil:
+	h, ok := idHash(d["id"])
+	if !ok {
 		*rr++ // ;; no id, nothing can replace it, so any stream will do
 		return *rr % n
-	case string:
-		key = id
-	case []byte:
-		key = string(id)
-	case int:
-		key = strconv.FormatInt(int64(id), 10)
-	case int8:
-		key = strconv.FormatInt(int64(id), 10)
-	case int16:
-		key = strconv.FormatInt(int64(id), 10)
-	case int32:
-		key = strconv.FormatInt(int64(id), 10)
-	case int64:
-		key = strconv.FormatInt(id, 10)
-	case uint8:
-		key = strconv.FormatUint(uint64(id), 10)
-	case uint16:
-		key = strconv.FormatUint(uint64(id), 10)
-	case uint32:
-		key = strconv.FormatUint(uint64(id), 10)
-	default:
-		key = fmt.Sprint(id)
 	}
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return int(h.Sum32() % uint32(n))
+	return int(h % uint64(n))
+}
+
+var laneSeed = maphash.MakeSeed()
+
+// idPrefix ;; with long_terms truncate Luxir merges ids that share their first 255 bytes backed off to a
+// ;; UTF-8 boundary (at least 252), so only that much of an id can decide its stream
+const idPrefix = 252
+
+// idHash ;; equal ids in Luxir's eyes always hash the same, different ids may share a hash (that only costs balance)
+//
+// ;; Luxir makes a numeric id a string (1000030.0, 1000030 and "1000030" are one id) with its own float
+// ;; formatting, so every number, and every string that reads as one, hashes by its value instead of its text
+func idHash(id any) (uint64, bool) {
+	switch id := id.(type) {
+	case nil:
+		return 0, false
+	case string:
+		return strHash(id), true
+	case []byte:
+		return strHash(string(id)), true
+	case bool:
+		return strHash(strconv.FormatBool(id)), true
+	case int:
+		return numHash(float64(id)), true
+	case int8:
+		return numHash(float64(id)), true
+	case int16:
+		return numHash(float64(id)), true
+	case int32:
+		return numHash(float64(id)), true
+	case int64:
+		return numHash(float64(id)), true
+	case uint8:
+		return numHash(float64(id)), true
+	case uint16:
+		return numHash(float64(id)), true
+	case uint32:
+		return numHash(float64(id)), true
+	case float32:
+		// ;; Luxir writes a float32 with float32 digits, 1.1 not 1.100000023841858, read those digits as a float64
+		return strHash(strconv.FormatFloat(float64(id), 'g', -1, 32)), true
+	case float64:
+		return numHash(id), true
+	case time.Time:
+		return numHash(float64(id.UnixMilli())), true
+	}
+	return strHash(fmt.Sprint(id)), true
+}
+
+func strHash(s string) uint64 {
+	if len(s) > idPrefix {
+		s = s[:idPrefix]
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return numHash(f)
+	}
+	return maphash.String(laneSeed, s)
+}
+
+func numHash(f float64) uint64 {
+	switch {
+	case f == 0:
+		f = 0 // ;; -0 too
+	case math.IsNaN(f):
+		f = math.NaN()
+	}
+	return maphash.Comparable(laneSeed, math.Float64bits(f))
 }
 
 // streamLane ;; one update stream, its next batch, and the goroutines feeding and reading it

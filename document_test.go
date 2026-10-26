@@ -1,6 +1,7 @@
 package luxir
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -207,6 +208,57 @@ func TestToMap_BadNestedElement(t *testing.T) {
 	for _, part := range []string{`"list_ss"`, "element 1"} {
 		if !strings.Contains(err.Error(), part) {
 			t.Errorf("err = %q, want it to contain %s", err, part)
+		}
+	}
+}
+
+// TestToVal_CopiesSlices ;; a converted value never shares memory with the caller's slices
+func TestToVal_CopiesSlices(t *testing.T) {
+	bs, ss, is := []byte("ab"), []string{"a"}, []int64{1}
+	f32, f64, bins := []float32{1}, []float64{1}, [][]byte{[]byte("a")}
+	pts, vecs := [][]float64{{1, 2}}, [][]float32{{1, 2}}
+	in := []any{bs, ss, is, f32, f64, bins, pts, vecs}
+	var got, want []*luxirpb.Val
+	for _, v := range in {
+		val, err := toVal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, want = append(got, val), append(want, proto.CloneOf(val))
+	}
+	bs[0], ss[0], is[0], f32[0], f64[0], bins[0][0], pts[0][0], vecs[0][0] = 'z', "z", 9, 9, 9, 'z', 9, 9
+	for i := range got {
+		if !proto.Equal(got[i], want[i]) {
+			t.Errorf("toVal(%T) changed with its source: got %v, want %v", in[i], got[i], want[i])
+		}
+	}
+}
+
+// TestFromVal_Kinds ;; the response kinds toVal never sends still come back native
+func TestFromVal_Kinds(t *testing.T) {
+	tests := []struct {
+		text string
+		want any
+	}{
+		{``, nil},
+		{`null:NULL_VALUE`, nil},
+		{`arr_f:{v:1.5 v:2}`, []float32{1.5, 2}},
+		{`arr_bin:{v:"a" v:"b"}`, [][]byte{[]byte("a"), []byte("b")}},
+		{`map:{fields:{key:"k" value:{s:"v"}}}`, Document{"k": "v"}},
+	}
+	for _, tt := range tests {
+		got, err := fromVal(parseText(t, tt.text, &luxirpb.Val{}))
+		if err != nil || !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("fromVal(%s) = %#v, %v, want %#v", tt.text, got, err, tt.want)
+		}
+	}
+}
+
+func TestToHit_Score(t *testing.T) {
+	for _, text := range []string{`fields:{key:"_score_" value:{f:1.5}}`, `fields:{key:"_score_" value:{d:1.5}}`} {
+		h, err := toHit(parseText(t, text, &luxirpb.Map{}))
+		if err != nil || h.Score != 1.5 || len(h.Doc) != 0 {
+			t.Errorf("toHit(%s) = %+v, %v, want score 1.5 and no _score_ field", text, h, err)
 		}
 	}
 }

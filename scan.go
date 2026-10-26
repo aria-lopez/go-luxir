@@ -52,7 +52,7 @@ func (l *Luxir) Scan(ctx context.Context, collection string, q Query, opts ...Se
 				yield(Hit{}, &SearchError{Msg: err.Error(), Err: err})
 				return
 			}
-			for i, m := range dl.GetDocs() {
+			for i, m := range rows(dl) {
 				h, err := toHit(m)
 				if err != nil {
 					yield(Hit{}, &SearchError{Msg: fmt.Sprintf("err on hit %d: %v", i, err), Err: err})

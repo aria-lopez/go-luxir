@@ -56,13 +56,14 @@ type Facet struct {
 }
 
 // decodeOps ;; protobuf op results to native, nil when there are none
-func decodeOps(m map[string]*luxirpb.Val) (OpResults, error) {
+// ;; req is the ops that were asked for, nil when unknown
+func decodeOps(m map[string]*luxirpb.Val, req map[string]*luxirpb.SearchOp) (OpResults, error) {
 	if len(m) == 0 {
 		return nil, nil
 	}
 	out := make(OpResults, len(m))
 	for name, v := range m {
-		val, err := decodeVal(v)
+		val, err := decodeVal(v, req[name])
 		if err != nil {
 			return nil, fmt.Errorf("op %q: %w", name, err)
 		}
@@ -71,7 +72,8 @@ func decodeOps(m map[string]*luxirpb.Val) (OpResults, error) {
 	return out, nil
 }
 
-func decodeVal(v *luxirpb.Val) (any, error) {
+// decodeVal ;; one op result, op is the op that asked for it (nil when unknown)
+func decodeVal(v *luxirpb.Val, op *luxirpb.SearchOp) (any, error) {
 	switch x := v.GetKind().(type) {
 	case nil, *luxirpb.Val_Null:
 		return nil, nil
@@ -82,20 +84,20 @@ func decodeVal(v *luxirpb.Val) (any, error) {
 	case *luxirpb.Val_F:
 		return float64(x.F), nil
 	case *luxirpb.Val_Docs:
-		return decodeDocs(x.Docs)
+		return decodeDocs(x.Docs, op)
 	case *luxirpb.Val_Facet:
-		return decodeFacet(x.Facet)
+		return decodeFacet(x.Facet, op)
 	default:
 		return fromVal(v)
 	}
 }
 
 // decodeDocs ;; a merged doc list to a *SearchResult, rows only
-func decodeDocs(dl *luxirpb.DocList) (*SearchResult, error) {
+func decodeDocs(dl *luxirpb.DocList, op *luxirpb.SearchOp) (*SearchResult, error) {
 	if len(dl.GetColumns()) > 0 {
 		return nil, errors.New("documents came back as columns, expected rows")
 	}
-	res := &SearchResult{Found: dl.GetFound(), Offset: dl.GetOffset(), uncounted: dl.Found == nil}
+	res := &SearchResult{Found: dl.GetFound(), Offset: dl.GetOffset(), uncounted: dl.Found == nil, limit: pageLimit(op)}
 	for i, m := range dl.GetDocs() {
 		h, err := toHit(m)
 		if err != nil {
@@ -103,7 +105,7 @@ func decodeDocs(dl *luxirpb.DocList) (*SearchResult, error) {
 		}
 		res.Hits = append(res.Hits, h)
 	}
-	ops, err := decodeOps(dl.GetOps())
+	ops, err := decodeOps(dl.GetOps(), subOps(op))
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +113,41 @@ func decodeDocs(dl *luxirpb.DocList) (*SearchResult, error) {
 	return res, nil
 }
 
-func decodeFacet(f *luxirpb.FacetResult) (*Facet, error) {
+// pageLimit ;; how many hits a full page of op holds (Luxir's default is 10), 0 when op is unknown
+func pageLimit(op *luxirpb.SearchOp) int64 {
+	var limit *int64
+	switch k := op.GetKind().(type) {
+	case *luxirpb.SearchOp_TopDocs:
+		limit = k.TopDocs.Limit
+	case *luxirpb.SearchOp_Fusion:
+		limit = k.Fusion.Limit
+	default:
+		return 0
+	}
+	if limit == nil {
+		return 10
+	}
+	return *limit
+}
+
+// subOps ;; the ops op asked to run under it
+func subOps(op *luxirpb.SearchOp) map[string]*luxirpb.SearchOp {
+	switch k := op.GetKind().(type) {
+	case *luxirpb.SearchOp_TopDocs:
+		return k.TopDocs.GetOps()
+	case *luxirpb.SearchOp_Fusion:
+		return k.Fusion.GetOps()
+	case *luxirpb.SearchOp_FieldFacet:
+		return k.FieldFacet.GetOps()
+	case *luxirpb.SearchOp_RangeFacet:
+		return k.RangeFacet.GetOps()
+	case *luxirpb.SearchOp_QueryFacet:
+		return k.QueryFacet.GetOps()
+	}
+	return nil
+}
+
+func decodeFacet(f *luxirpb.FacetResult, op *luxirpb.SearchOp) (*Facet, error) {
 	keys, err := columnValues(f.GetBucketIds())
 	if err != nil {
 		return nil, err
@@ -131,13 +167,14 @@ func decodeFacet(f *luxirpb.FacetResult) (*Facet, error) {
 	}
 
 	// each sub op comes as one list with a result per bucket
+	subs := subOps(op)
 	for name, v := range f.GetOps() {
 		per := v.GetArr().GetV()
 		if len(per) != len(out.Buckets) {
 			return nil, fmt.Errorf("sub op %q has %d results for %d buckets", name, len(per), len(out.Buckets))
 		}
 		for i, e := range per {
-			val, err := decodeVal(e)
+			val, err := decodeVal(e, subs[name])
 			if err != nil {
 				return nil, fmt.Errorf("sub op %q bucket %d: %w", name, i, err)
 			}

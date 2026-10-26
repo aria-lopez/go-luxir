@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -386,3 +387,33 @@ func TestSearch_WalkPages(t *testing.T) {
 		t.Errorf("ids = %v, want [b1 b2 b3]", all)
 	}
 }
+
+// TestSearch_SendFails ;; a request gRPC can't encode (strings must be UTF-8) or a send side that won't close
+func TestSearch_SendFails(t *testing.T) {
+	l, f := fakeLuxir(t, fakeReply(&luxirpb.SearchResponse{}))
+	_, err := l.Search(timeout(t), "bad\xff", nil)
+	var se *SearchError
+	if !errors.As(err, &se) || status.Code(se.Err) != codes.Internal {
+		t.Errorf("Search = %v, want a *SearchError with the marshal failure", err)
+	}
+	if f.calls() != 0 {
+		t.Errorf("server got %d requests, want none", f.calls())
+	}
+
+	closeErr := errors.New("close refused")
+	l, _ = fakeLuxirWith(t, fakeReply(&luxirpb.SearchResponse{}), WithDialOptions(grpc.WithStreamInterceptor(
+		func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			s, err := streamer(ctx, desc, cc, method, opts...)
+			return closeFails{s, closeErr}, err
+		})))
+	if _, err := l.Search(timeout(t), "c", nil); !errors.Is(err, closeErr) {
+		t.Errorf("Search = %v, want the CloseSend error", err)
+	}
+}
+
+type closeFails struct {
+	grpc.ClientStream
+	err error
+}
+
+func (c closeFails) CloseSend() error { return c.err }

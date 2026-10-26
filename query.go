@@ -18,6 +18,9 @@ type queryFunc func() (*luxirpb.Query, error)
 
 func (f queryFunc) toProto() (*luxirpb.Query, error) { return f() }
 
+// clamp32 ;; n as an int32, out of range saturates instead of wrapping so a huge value stays huge and range checks still catch it
+func clamp32(n int) int32 { return int32(min(max(n, math.MinInt32), math.MaxInt32)) }
+
 // Raw ;; for any query that doesnt have a helper (returns as protobuf query)
 func Raw(q *luxirpb.Query) Query {
 	return queryFunc(func() (*luxirpb.Query, error) { return q, nil })
@@ -92,7 +95,7 @@ func Match(field string, v any, opts ...MatchOption) Query {
 		if s.minMatch < 0 {
 			return nil, queryErr("match", "min match must not be negative: %d", s.minMatch)
 		}
-		m := &luxirpb.Match{Field: field, Val: val, Operator: s.op, MinMatch: int32(s.minMatch)}
+		m := &luxirpb.Match{Field: field, Val: val, Operator: s.op, MinMatch: clamp32(s.minMatch)}
 		return &luxirpb.Query{Kind: &luxirpb.Query_Match{Match: m}}, nil
 	})
 }
@@ -112,7 +115,7 @@ func SimpleWith(q string, fields []string, opts ...MatchOption) Query {
 		if s.minMatch < 0 {
 			return nil, queryErr("simple", "min match must not be negative: %d", s.minMatch)
 		}
-		sq := &luxirpb.SimpleQuery{Q: q, Fields: fields, Operator: s.op, MinMatch: int32(s.minMatch), AllowedFields: s.allowed}
+		sq := &luxirpb.SimpleQuery{Q: q, Fields: fields, Operator: s.op, MinMatch: clamp32(s.minMatch), AllowedFields: s.allowed}
 		return &luxirpb.Query{Kind: &luxirpb.Query_SimpleQuery{SimpleQuery: sq}}, nil
 	})
 }
@@ -157,7 +160,7 @@ func Regex(field, pattern string) Query {
 type PhraseOption func(*luxirpb.PhraseQuery)
 
 // Slop ;; how far the words may drift apart, 0 is exact
-func Slop(n int) PhraseOption { return func(p *luxirpb.PhraseQuery) { p.Slop = int32(n) } }
+func Slop(n int) PhraseOption { return func(p *luxirpb.PhraseQuery) { p.Slop = clamp32(n) } }
 
 // Phrase ;; the words of text next to each other, in order
 func Phrase(field, text string, opts ...PhraseOption) Query {
@@ -189,17 +192,17 @@ type FuzzyOption func(*luxirpb.FuzzyQuery)
 
 // MaxEdits ;; 0 to 2, left out Luxir picks by term length
 func MaxEdits(n int) FuzzyOption {
-	return func(f *luxirpb.FuzzyQuery) { v := int32(n); f.MaxEdits = &v }
+	return func(f *luxirpb.FuzzyQuery) { v := clamp32(n); f.MaxEdits = &v }
 }
 
 // PrefixLength ;; leading bytes that must match exactly, left out is 1
 func PrefixLength(n int) FuzzyOption {
-	return func(f *luxirpb.FuzzyQuery) { v := int32(n); f.PrefixLength = &v }
+	return func(f *luxirpb.FuzzyQuery) { v := clamp32(n); f.PrefixLength = &v }
 }
 
 // MaxExpansions ;; cap on terms tried, left out is 50
 func MaxExpansions(n int) FuzzyOption {
-	return func(f *luxirpb.FuzzyQuery) { f.MaxExpansions = int32(n) }
+	return func(f *luxirpb.FuzzyQuery) { f.MaxExpansions = clamp32(n) }
 }
 
 // Fuzzy ;; terms within a few edits of term
@@ -226,21 +229,23 @@ func Fuzzy(field, term string, opts ...FuzzyOption) Query {
 // AnyOf ;; the field equals any of values, exact and constant score, one slice works as the values too
 func AnyOf(field string, values ...any) Query {
 	return queryFunc(func() (*luxirpb.Query, error) {
-		if len(values) == 1 {
-			switch vs := values[0].(type) {
+		// ;; a local copy, the query can be shared and built by several searches at once
+		vals := values
+		if len(vals) == 1 {
+			switch vs := vals[0].(type) {
 			case []any:
-				values = vs
+				vals = vs
 			case []string, []int, []int64, []float32, []float64:
 				val, _ := toVal(vs)
 				return &luxirpb.Query{Kind: &luxirpb.Query_AnyOf{AnyOf: &luxirpb.AnyOfQuery{Field: field, Values: val}}}, nil
 			}
 		}
-		for i, v := range values {
+		for i, v := range vals {
 			if v == nil {
 				return nil, queryErr("any_of", "%q value %d is nil", field, i)
 			}
 		}
-		val, err := toVal(values)
+		val, err := toVal(vals)
 		if err != nil {
 			return nil, &QueryError{Query: "any_of", Err: err}
 		}
@@ -306,7 +311,7 @@ func Exact() KnnOption { return func(k *luxirpb.KnnQuery) { k.Exact = true } }
 
 // RefineCandidates ;; approximate candidates rescored at full precision
 func RefineCandidates(n int) KnnOption {
-	return func(k *luxirpb.KnnQuery) { k.RefineCandidates = int32(n) }
+	return func(k *luxirpb.KnnQuery) { k.RefineCandidates = clamp32(n) }
 }
 
 func ivf(k *luxirpb.KnnQuery) *luxirpb.KnnQuery_Ivf {
@@ -317,7 +322,7 @@ func ivf(k *luxirpb.KnnQuery) *luxirpb.KnnQuery_Ivf {
 }
 
 // Nprobe ;; IVF lists to probe, 0 is adaptive
-func Nprobe(n int) KnnOption { return func(k *luxirpb.KnnQuery) { ivf(k).Nprobe = int32(n) } }
+func Nprobe(n int) KnnOption { return func(k *luxirpb.KnnQuery) { ivf(k).Nprobe = clamp32(n) } }
 
 // MinScanFraction ;; least fraction of vectors to scan, 0 to 1
 func MinScanFraction(f float32) KnnOption {
@@ -502,7 +507,7 @@ func Bool(opts ...BoolOption) Query {
 		if s.minShould < 0 {
 			return nil, queryErr("bool", "min should must not be negative: %d", s.minShould)
 		}
-		b := &luxirpb.BooleanQuery{MinMatch: int32(s.minShould)}
+		b := &luxirpb.BooleanQuery{MinMatch: clamp32(s.minShould)}
 		for _, g := range []struct {
 			qs  []Query
 			dst *[]*luxirpb.Query

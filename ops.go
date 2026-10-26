@@ -208,7 +208,7 @@ func Gap(v any) OpOption { return func(s *opSpec) { s.use("Gap", kRange); s.gap 
 func CalendarGap(n int, unit luxirpb.CalendarGap_Unit) OpOption {
 	return func(s *opSpec) {
 		s.use("CalendarGap", kRange)
-		s.cal = &luxirpb.CalendarGap{N: int32(n), Unit: unit}
+		s.cal = &luxirpb.CalendarGap{N: clamp32(n), Unit: unit}
 	}
 }
 
