@@ -2,7 +2,7 @@
 
 A Go client for the [Luxir](https://luxir.org) search engine, over gRPC.
 
-It covers the whole Luxir API: indexing (single calls and streamed bulk loads), deletes and commits, collections and schemas, every query type, sorting, filters, paging, streaming exports, facets and metrics, hybrid (vector + text) search, and node stats. You build requests with plain Go values and typed helpers; there's no protobuf boilerplate unless you want it.
+Covers most everything I could find via the docs, the main aim of this is just to give anyone a working Luxir conn ideally without having to interface too much with the protobuf types and boilerplate
 
 ## install
 
@@ -10,7 +10,7 @@ It covers the whole Luxir API: indexing (single calls and streamed bulk loads), 
 go get github.com/aria-lopez/go-luxir
 ```
 
-Needs Go 1.26+ and a running Luxir node (built against Luxir v0.1.0). Luxir serves gRPC on port **9401** by default, which is also this client's default.
+You need Go 1.26+
 
 ## quickstart
 
@@ -26,32 +26,75 @@ import (
 )
 
 func main() {
-    ctx := context.Background()
+  ctx := contex.Background()
+  // create new instance of luxir, if u pass "" the default it localhost:9401
+  /* You can also pass this as opts for auth (luxir.NewLuxir(addr, ...opts))
+    luxir.WithTLS(&tls.Config{})
+    luxir.WithMaxMessageSize(32<<20)
+    luxir.WithDialOptions(grpc.WithPerRPCCredentials(myToken))) // anything gRPC offers
+  */
+  l, err := luxir.NewLuxir("localhost:9401")
+  if err != nil {
+    // returns *ConnectError here but it doesnt mean a dial failed its usually bad config with grpc.NewClient()
+  }
+  defer l.Close()
 
-    l, err := luxir.NewLuxir("localhost:9401") // "" also means localhost:9401
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer l.Close()
+  // once connected you can verify by grabbing your available collections
+  colls, err := l.GetCollections(ctx)
+  if err != nil {
+      // handle *CollectionError
+  }
+  var colName string
+  for _, c := range colls {
+    // here you get a []*luxirpb.CollectionStats
+    collName = c.GetName() // can get name or whtv u need
+  }
 
-    // the field suffix sets the type: _t text, _s string, _i int, _d double, _ss many strings, ...
-    _, err = l.Index(ctx, "books", []luxir.Document{
-        {"id": "b1", "title_t": "Dune", "year_i": 1965, "author_s": "Herbert", "tags_ss": []string{"scifi", "classic"}},
-        {"id": "b2", "title_t": "Dune Messiah", "year_i": 1969, "author_s": "Herbert", "tags_ss": []string{"scifi"}},
-        {"id": "b3", "title_t": "Neuromancer", "year_i": 1984, "author_s": "Gibson"},
-    }, luxir.WithCommit()) // commit makes them searchable before Index returns
-    if err != nil {
-        log.Fatal(err)
-    }
+  // set a new schema
+  schema := luxir.NewSchema().
+      Text("title").
+      String("author").
+      Int("year", luxir.Range()). // Range() enables numeric range queries
+      Date("published", luxir.Range()).
+      Geo("location", luxir.Range()).
+      Vector("embedding", 384, luxirpb.VectorMetric_COSINE).
+      Template("_tag", luxirpb.FieldDef_STRING, luxir.Multi()).
+      MustBuild() // or Build() if you dont want it to panic
 
-    res, err := l.Search(ctx, "books", luxir.Match("title_t", "dune"), luxir.WithSort("year_i", false))
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Println(res.Found) // 2
-    for _, h := range res.Hits {
-        fmt.Println(h.Score, h.Doc["id"], h.Doc["title_t"])
-    }
+  // use it in a new collection
+  err := l.CreateCollection(ctx, "books", schema) // nil schema = Luxir's defaults
+  if errors.Is(err, luxir.ErrCollectionExists) {
+    // already there so handle it
+  }
+
+  // get a schema
+  def, err := l.GetSchema(ctx, "books")
+  // add or update scheme
+  def, err = l.SetSchema(ctx, "books", luxir.NewSchema().Double("price").MustBuild())
+  // or replace it
+  def, err = l.ReplaceSchema(ctx, "books", schema)
+
+  // insert some documents
+  _, err = l.Index(ctx, "books", []luxir.Document{
+      {"id": "b1", "title_t": "Dune", "year_i": 1965, "author_s": "Herbert", "tags_ss": []string{"scifi", "classic"}},
+      {"id": "b2", "title_t": "Dune Messiah", "year_i": 1969, "author_s": "Herbert", "tags_ss": []string{"scifi"}},
+      {"id": "b3", "title_t": "Neuromancer", "year_i": 1984, "author_s": "Gibson"},
+  }, luxir.WithCommit()) // withcommit means its searchable right away
+  if err != nil {
+    // handle *UpdateError
+  }
+
+  // get some documents and do something with them
+  res, err := l.Search(ctx, "books", luxir.Match("title_t", "dune"), luxir.WithSort("year_i", false))
+  if err != nil {
+      log.Fatal(err)
+  }
+  fmt.Println(res.Found)
+  for _, h := range res.Hits {
+      fmt.Println(h.Score, h.Doc["id"], h.Doc["title_t"])
+  }
+
+  // and so much more... you get the point
 }
 ```
 
@@ -61,17 +104,17 @@ Every call takes a `context.Context` for deadlines and cancellation. A collectio
 
 A `luxir.Document` is a `map[string]any`. These values are accepted:
 
-| Go value | Luxir |
-|---|---|
-| `string`, `bool` | text / string fields |
-| `int`, `int8`-`int64`, `uint8`-`uint32` | int fields |
-| `float32`, `float64` | float / double fields |
-| `time.Time` | date fields (sent as epoch millis) |
-| `luxir.Point{Lat, Lon}`, `[]luxir.Point` | geo fields |
-| `[]string`, `[]int`, `[]int64`, `[]float64`, `[]any` | multi-valued fields |
-| `[]float32` | a vector |
-| `[][]float32` | a multi-valued vector field |
-| `nil` | null |
+| Go value                                             | Luxir                              |
+| ---------------------------------------------------- | ---------------------------------- |
+| `string`, `bool`                                     | text / string fields               |
+| `int`, `int8`-`int64`, `uint8`-`uint32`              | int fields                         |
+| `float32`, `float64`                                 | float / double fields              |
+| `time.Time`                                          | date fields (sent as epoch millis) |
+| `luxir.Point{Lat, Lon}`, `[]luxir.Point`             | geo fields                         |
+| `[]string`, `[]int`, `[]int64`, `[]float64`, `[]any` | multi-valued fields                |
+| `[]float32`                                          | a vector                           |
+| `[][]float32`                                        | a multi-valued vector field        |
+| `nil`                                                | null                               |
 
 `uint`, `uint64`, nested maps and structs are rejected before anything is sent: a `uint64` can overflow Luxir's int64, and Luxir has no nested objects.
 
@@ -99,15 +142,15 @@ Writing to a collection that doesn't exist creates it with Luxir's default schem
 
 Update options (for `Index`, `IndexStream`, `Delete` and `Commit`):
 
-| option | what it does |
-|---|---|
-| `WithCommit()` | commit before returning, so the change is searchable |
-| `WithCommitWithin(d)` | commit within `d` and return without waiting (commits close together are merged) |
-| `WithAllOrNone()` | one bad document rolls back the whole request (per batch for `IndexStream`) |
-| `WithReturnIDs()` | the response lists the indexed ids, in order |
-| `WithAllowDups()` | skip replace-by-id, faster but only when every id is new |
-| `WithFieldMap(m)` / `WithDropUnmapped()` | rename document keys onto schema fields for this call |
-| `WithWaitForMerges()`, `WithMaxSegments(n)`, `WithBuildAuxIndexes("*")` | commit-time maintenance |
+| option                                                                  | what it does                                                                     |
+| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `WithCommit()`                                                          | commit before returning, so the change is searchable                             |
+| `WithCommitWithin(d)`                                                   | commit within `d` and return without waiting (commits close together are merged) |
+| `WithAllOrNone()`                                                       | one bad document rolls back the whole request (per batch for `IndexStream`)      |
+| `WithReturnIDs()`                                                       | the response lists the indexed ids, in order                                     |
+| `WithAllowDups()`                                                       | skip replace-by-id, faster but only when every id is new                         |
+| `WithFieldMap(m)` / `WithDropUnmapped()`                                | rename document keys onto schema fields for this call                            |
+| `WithWaitForMerges()`, `WithMaxSegments(n)`, `WithBuildAuxIndexes("*")` | commit-time maintenance                                                          |
 
 Some documents can fail while others succeed. You get a `*luxir.IndexError` with the details:
 
@@ -192,18 +235,18 @@ Never paste user input into an `Expr` string. Pass it in `vars`, which Luxir bin
 
 Search options:
 
-| option | what it does |
-|---|---|
-| `WithLimit(n)` | page size, default 10, `-1` for all |
-| `WithOffset(n)` | skip the first n, for paging |
-| `WithSort(expr, desc)` / `WithSortVars(...)` | order by a field or an expression, repeat for tie-breakers |
-| `WithFilter(q)` | must also match `q`, doesn't change scores |
-| `WithFields("id", "title_t")` | only return these fields, `*` patterns work |
-| `WithCount(false)`, `WithScores(false)` | skip counting matches or scoring them |
-| `WithTimeZone("America/Denver")` | zone for dates without an offset and date math |
-| `WithFreshness(d)` | accept an index view up to `d` old |
-| `WithOp(name, op)` | add a facet, metric, ... (see below) |
-| `WithProfile()`, `WithRequestID(id)`, `WithBatchSize(n)`, `WithMaxParallel(n)` | tuning and debugging |
+| option                                                                         | what it does                                               |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------------- |
+| `WithLimit(n)`                                                                 | page size, default 10, `-1` for all                        |
+| `WithOffset(n)`                                                                | skip the first n, for paging                               |
+| `WithSort(expr, desc)` / `WithSortVars(...)`                                   | order by a field or an expression, repeat for tie-breakers |
+| `WithFilter(q)`                                                                | must also match `q`, doesn't change scores                 |
+| `WithFields("id", "title_t")`                                                  | only return these fields, `*` patterns work                |
+| `WithCount(false)`, `WithScores(false)`                                        | skip counting matches or scoring them                      |
+| `WithTimeZone("America/Denver")`                                               | zone for dates without an offset and date math             |
+| `WithFreshness(d)`                                                             | accept an index view up to `d` old                         |
+| `WithOp(name, op)`                                                             | add a facet, metric, ... (see below)                       |
+| `WithProfile()`, `WithRequestID(id)`, `WithBatchSize(n)`, `WithMaxParallel(n)` | tuning and debugging                                       |
 
 An option that doesn't apply to a call, like `WithSort` on `Fuse`, returns an error. Options are never silently ignored.
 
@@ -295,14 +338,14 @@ recent := out.Ops.Docs("recent")
 
 Every call returns a typed error. Use `errors.As` to inspect it:
 
-| error | from |
-|---|---|
-| `*luxir.SearchError` | `Search`, `Scan`, `Fuse`, `Do`. `RequestFailed()` is Luxir's own rejection (kind, code, message) |
-| `*luxir.IndexError` | `Index`, `IndexStream`, `Commit`. Per-document failures and the request-level error |
-| `*luxir.DeleteError` | `Delete` |
-| `*luxir.CollectionError` | collection, schema, stats and cache calls. Matches `ErrCollectionExists` / `ErrCollectionNotFound` |
-| `*luxir.QueryError`, `*luxir.OpError`, `*luxir.SchemaError` | a helper got bad input. Caught before anything is sent |
-| `*luxir.ConnectError`, `*luxir.HealthCheckError` | `NewLuxir`, `HealthCheck` |
+| error                                                       | from                                                                                               |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `*luxir.SearchError`                                        | `Search`, `Scan`, `Fuse`, `Do`. `RequestFailed()` is Luxir's own rejection (kind, code, message)   |
+| `*luxir.IndexError`                                         | `Index`, `IndexStream`, `Commit`. Per-document failures and the request-level error                |
+| `*luxir.DeleteError`                                        | `Delete`                                                                                           |
+| `*luxir.CollectionError`                                    | collection, schema, stats and cache calls. Matches `ErrCollectionExists` / `ErrCollectionNotFound` |
+| `*luxir.QueryError`, `*luxir.OpError`, `*luxir.SchemaError` | a helper got bad input. Caught before anything is sent                                             |
+| `*luxir.ConnectError`, `*luxir.HealthCheckError`            | `NewLuxir`, `HealthCheck`                                                                          |
 
 The gRPC status is kept underneath, so `status.Code(err)` still works (for example, `codes.Unavailable` when the node is down).
 
